@@ -1,0 +1,12 @@
+{
+  "name": "codex-dev",
+  "displayName": "Codex Dev",
+  "version": "1.0.0",
+  "description": "Antigravity x Codex CLI automated development workflow: Plan, Execute in isolated Git worktrees, Verify independently, Semantic Code Review, Auto-Repair (up to 3 rounds), and Read-Only Monitor side panel.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/codex-dev Add a new feature with full unit tests and review",
+    "/codex-dev Check current task status and open Codex Dev Monitor",
+    "/codex-dev Fix the failing tests using a locked Codex model"
+  ]
+}

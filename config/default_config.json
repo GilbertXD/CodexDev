@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "codex_binary": "codex",
+  "sandbox_mode": "workspace-write",
+  "max_repair_rounds": 3,
+  "codex_timeout_sec": 600,
+  "verify_timeout_sec": 300,
+  "model_policy": {
+    "mode": "auto",
+    "locked": false,
+    "allow_escalation": true,
+    "default_model": null,
+    "authorized_models": [],
+    "complexity_routing": {
+      "low": null,
+      "medium": null,
+      "high": null
+    },
+    "escalation_order": [],
+    "reasoning_effort": "medium"
+  },
+  "reviewer": {
+    "mode": "inherit_session",
+    "routing_supported": false,
+    "model": null
+  },
+  "git": {
+    "branch_prefix": "codex-dev/",
+    "auto_commit": false,
+    "auto_push": false,
+    "auto_merge": false
+  }
+}

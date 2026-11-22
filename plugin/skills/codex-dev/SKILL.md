@@ -1,0 +1,124 @@
+---
+name: codex-dev
+description: >-
+  Antigravity x Codex CLI automated development workflow (Plan -> Execute -> Verify -> Review -> Repair -> Deliver).
+  Use when the user invokes /codex-dev or asks to develop, refactor, or fix code in any Git repository with Antigravity as Architect/Reviewer, Codex CLI as Builder in an isolated Git worktree, deterministic Python orchestration, and the read-only Codex Dev Monitor side panel.
+---
+
+# Codex Dev — Antigravity × Codex CLI Workflow
+
+You are the **Architect** and **Reviewer**. **Codex CLI** is the **Builder**. The **Python Orchestrator** (`codex-dev`) manages the deterministic state machine, isolated Git worktrees, independent verification, and persistent artifacts under `~/.codex-dev/`. The **Codex Dev Monitor** MCP App side panel is strictly read-only.
+
+**Antigravity chat is the sole control surface.** Never ask the user to manually copy `PLAN.md` or run orchestrator shell commands themselves.
+
+## Operating Rules
+
+1. **Orchestrator binary**: Run `codex-dev` (installed at `~/.local/bin/codex-dev`, fallback `python3 ~/.codex-dev/runtime/run_cli.py`). See [references/workflow-cli.md](./references/workflow-cli.md) for full flags.
+2. **Model policy (strict)**:
+   - Run `codex-dev models --repo <repo>` first to inspect the user's verified `authorized_models` and policy (`auto` vs `manual`).
+   - **Auto mode (default)**: Select complexity (`low` | `medium` | `high`) based on scope and risk; the orchestrator picks from `authorized_models` and may escalate within `authorized_models` on repair rounds.
+   - **Manual / Locked mode**: If the user specifies a Codex model (e.g. "use `gpt-6.2-sol`" or "lock `gpt-6-luna`"), pass `--model-mode manual --model <id> --lock-model`.
+   - Never guess or substitute unverified model IDs. If a requested model is unauthorized, report the verified list and ask the user.
+   - **Reviewer model**: Inherits your current Antigravity session model by default.
+3. **Read-only Monitor**: After initializing a task, call the `open_monitor` tool on the `codex-dev_monitor` MCP server (when connected) to open the **Codex Dev Monitor** side panel (`aux_pane`) so the user can observe live progress.
+4. **Git safety**:
+   - Work always happens in an isolated Git worktree (`~/.codex-dev/worktrees/<task_id>`). Never overwrite uncommitted changes in the user's main repository.
+   - Never auto-commit, auto-push, auto-merge, or run destructive Git cleanups (`git clean -fdx`, `git reset --hard`) without explicit user confirmation in chat.
+
+## Intent Routing
+
+- **New development task**: Follow Steps 1–6 below.
+- **Status / progress check**: Run `codex-dev status` (or `codex-dev list`) and summarize state, phase, model, tests, diff stats, and latest review; optionally call `open_monitor`.
+- **Stop / cancel task**: Run `codex-dev cancel --reason "<reason>"` and confirm the task is `BLOCKED` (`cancelled`).
+- **Modify plan**: Update plan via `codex-dev plan --allow-replan --plan-file -` only when explicitly requested by the user, then resume execution.
+- **Recover crashed run**: Run `codex-dev recover`.
+- **Confirm commit / delivery**: Only after explicit user confirmation in chat, run `codex-dev deliver --confirm-commit --commit-message "<msg>"`.
+
+## Full Workflow (Plan → Execute → Verify → Review → Repair → Deliver)
+
+### Step 1 — Inspect Repo & Initialize Task
+1. Inspect the target Git repository (default: active workspace root) and read relevant files to understand architecture, test stack, and conventions.
+2. Run `codex-dev models --repo <repo>` to verify authorized Builder models.
+3. Initialize the task:
+   ```bash
+   codex-dev init \
+     --name "<concise task title>" \
+     --repo "<repo_root>" \
+     --description "<user request summary>" \
+     --complexity <low|medium|high> \
+     [--model-mode manual --model <id> --lock-model]
+   ```
+4. If the `open_monitor` MCP tool is available, call it with `{"task_id": "<task_id>"}` to open the read-only side panel.
+
+### Step 2 — Author Immutable Plan Contract (`PLANNED`)
+Write a clear, testable `PLAN.md` containing:
+- `## Goal`
+- `## Target Files` (explicit expected files/directories in backticks)
+- `## Implementation Plan`
+- `## Acceptance Criteria` (concrete, verifiable checklist items)
+- `## Verification Commands` (project-specific test, build, lint, typecheck commands in backticks)
+- `## Out of Scope`
+
+Lock the contract via stdin so the user never copies anything:
+```bash
+codex-dev plan --task-id <task_id> --plan-file - <<'EOF'
+<PLAN.md contents>
+EOF
+```
+
+### Step 3 — Execute Builder & Run Independent Verification
+Run one deterministic Execute → Verify cycle:
+```bash
+codex-dev run-round --task-id <task_id>
+```
+Check the returned JSON `next_action`:
+- `review_required` → Proceed to **Step 4 (Code Review)**.
+- `repair_available` → Verification failed; `FEEDBACK.md` was generated automatically. Inspect the failure, enrich `FEEDBACK.md` if needed, and re-run `codex-dev run-round --task-id <task_id>` (up to 3 total repair rounds).
+- `blocked_retry_limit` → Max repair rounds (3) reached. Stop and report diagnostics clearly to the user.
+- `failed` or `blocked` → Inspect `state.failure_category` (`execution_failure`, `timeout`, `cancelled`, `invalid_model`, `contract_violation`) and report clearly to the user.
+
+### Step 4 — Semantic Code Review (Antigravity as Reviewer)
+When state is `REVIEWING`:
+1. Inspect the full diff and untracked files:
+   ```bash
+   codex-dev diff --task-id <task_id>
+   ```
+2. Inspect `verification.json` and `RESULT.json` via `codex-dev status --task-id <task_id>`.
+3. Verify semantically against the immutable `PLAN.md`:
+   - Every acceptance criterion is genuinely satisfied.
+   - No tests, linters, type checks, or configs were weakened or bypassed.
+   - No unintended or out-of-scope edits exist.
+   - Edge cases, error handling, readability, and security are solid.
+4. Record the verdict:
+   - If satisfied:
+     ```bash
+     codex-dev review --task-id <task_id> --verdict approve --summary "<concise approval conclusion>"
+     ```
+   - If issues found:
+     ```bash
+     codex-dev review --task-id <task_id> \
+       --verdict request_changes \
+       --summary "<concise summary>" \
+       --issue "<concrete issue 1>" \
+       --issue "<concrete issue 2>" \
+       --feedback "<actionable fix guidance>"
+     ```
+
+### Step 5 — Automatic Repair Loop (Max 3 Rounds)
+If `review` returns `next_action: "repair_available"`:
+- Immediately run `codex-dev run-round --task-id <task_id>` to dispatch Codex CLI for the incremental fix (in `auto` mode, the orchestrator may escalate within authorized models).
+- Repeat Steps 3–4 until `approve` (`COMPLETED`) or `blocked_retry_limit` (`BLOCKED`).
+
+### Step 6 — Deliver (Human-Confirmed Commit Only)
+Once `COMPLETED`:
+1. Run `codex-dev deliver --task-id <task_id>` (read-only summary — does NOT commit).
+2. Present to the user:
+   - What changed (files + diff stats)
+   - Verification results & Code Review conclusion
+   - Builder model(s) used, repair rounds, and token usage (if available)
+   - Worktree path and Git branch (`codex-dev/<task_id>`)
+   - Ask explicitly whether they would like to commit on the worktree branch (and propose a commit message), or inspect/merge manually.
+3. Only after the user confirms in chat, run:
+   ```bash
+   codex-dev deliver --task-id <task_id> --confirm-commit --commit-message "<confirmed message>"
+   ```

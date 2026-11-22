@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Dev Monitor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app" class="shell" aria-live="polite">
+      <header class="topbar">
+        <div class="brand">
+          <svg class="brand-mark" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="13" height="13" rx="2" stroke="currentColor" stroke-width="1.4" />
+            <path d="M5 6L7.5 8L5 10" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" />
+            <line x1="9" y1="10" x2="11.5" y2="10" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" />
+          </svg>
+          <span class="brand-title">CODEX DEV</span>
+          <span class="readonly-tag">READ-ONLY</span>
+        </div>
+        <div class="topbar-right">
+          <select id="task-selector" class="task-select hidden" aria-label="Select recorded task to view"></select>
+          <div id="sync-indicator" class="sync-pill" title="Live state synchronization status">
+            <span class="sync-dot" aria-hidden="true"></span>
+            <span id="sync-label">SYNC</span>
+          </div>
+        </div>
+      </header>
+
+      <main id="content" class="content">
+        <div class="empty-state">
+          <div class="empty-mark" aria-hidden="true"></div>
+          <p class="empty-title">Connecting to orchestrator state</p>
+          <p class="empty-sub">Waiting for snapshot from Codex Dev Monitor…</p>
+        </div>
+      </main>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

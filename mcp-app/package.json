@@ -1,0 +1,26 @@
+{
+  "name": "codex-dev-mcp-app",
+  "version": "1.0.0",
+  "description": "Read-only Codex Dev Monitor MCP App for Antigravity",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build:ui": "vite build && cp dist/index.html dist/monitor.html",
+    "build:server": "esbuild src/server.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/server.mjs --packages=external",
+    "build:server:standalone": "esbuild src/server.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/server.mjs --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
+    "build": "npm run typecheck && npm run build:ui && npm run build:server:standalone",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.2.0",
+    "vite-plugin-singlefile": "^2.2.0"
+  }
+}
