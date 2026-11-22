@@ -18,6 +18,15 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def normalize_target_path(raw: str) -> str:
+    """Strip only relative './' prefixes and leading '/', preserving dotfiles like .gitignore."""
+    tok = raw.strip()
+    while tok.startswith("./"):
+        tok = tok[2:]
+    tok = tok.lstrip("/")
+    return tok
+
+
 def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
     """Extract structured sections (acceptance criteria, target files, verify commands) from PLAN.md."""
     sections: dict[str, list[str]] = {}
@@ -57,11 +66,11 @@ def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
         bt = re.findall(r"`([^`]+)`", item)
         if bt:
             for token in bt:
-                tok = token.strip().lstrip("./")
+                tok = normalize_target_path(token)
                 if tok and " " not in tok:
                     target_files.append(tok)
         else:
-            tok = item.split()[0].strip("`'\"").lstrip("./")
+            tok = normalize_target_path(item.split()[0].strip("`'\""))
             if "/" in tok or "." in tok:
                 target_files.append(tok)
 
@@ -76,10 +85,22 @@ def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
         elif item:
             verify_commands.append(item)
 
+    prepare_cmds_raw = collect_bullets(
+        ("prepare", "dependency prep", "预处理", "依赖准备")
+    )
+    prepare_commands: list[str] = []
+    for item in prepare_cmds_raw:
+        bt = re.findall(r"`([^`]+)`", item)
+        if bt:
+            prepare_commands.append(bt[0].strip())
+        elif item:
+            prepare_commands.append(item)
+
     return {
         "acceptance_criteria": acceptance_criteria,
         "target_files": list(dict.fromkeys(target_files)),
         "verify_commands": list(dict.fromkeys(verify_commands)),
+        "prepare_commands": list(dict.fromkeys(prepare_commands)),
     }
 
 
@@ -88,6 +109,7 @@ def save_immutable_contract(
     plan_text: str,
     *,
     explicit_verify_commands: list[str] | None = None,
+    explicit_prepare_commands: list[str] | None = None,
     explicit_target_files: list[str] | None = None,
     allow_replan: bool = False,
 ) -> dict[str, Any]:
@@ -108,8 +130,13 @@ def save_immutable_contract(
         if explicit_verify_commands is not None
         else parsed["verify_commands"]
     )
+    prepare_cmds = (
+        list(explicit_prepare_commands)
+        if explicit_prepare_commands is not None
+        else parsed["prepare_commands"]
+    )
     target_files = (
-        list(explicit_target_files)
+        list(dict.fromkeys(normalize_target_path(p) for p in explicit_target_files if normalize_target_path(p)))
         if explicit_target_files is not None
         else parsed["target_files"]
     )
@@ -122,6 +149,7 @@ def save_immutable_contract(
         "acceptance_criteria": parsed["acceptance_criteria"],
         "target_files": target_files,
         "verify_commands": verify_cmds,
+        "prepare_commands": prepare_cmds,
         "created_at": utc_now(),
     }
 

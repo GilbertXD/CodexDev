@@ -15,7 +15,34 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sandbox_mode": "workspace-write",
     "max_repair_rounds": 3,
     "codex_timeout_sec": 600,
+    "codex_idle_timeout_sec": 300,
+    "codex_timeout_by_effort": {
+        "low": 600,
+        "medium": 600,
+        "high": 1200,
+        "xhigh": 1500,
+        "max": 1800,
+        "ultra": 1800,
+    },
+    "codex_timeout_by_complexity": {
+        "low": 600,
+        "medium": 600,
+        "high": 1200,
+    },
     "verify_timeout_sec": 300,
+    "builder_env": {},
+    "builder_add_dirs": [],
+    "prepare": {
+        "enabled": True,
+        "auto_go_mod_tidy": True,
+        "commands": [],
+        "timeout_sec": 180,
+        "env": {},
+    },
+    "verify": {
+        "commands": [],
+        "env": {},
+    },
     "model_policy": {
         "mode": "auto",
         "locked": False,
@@ -162,6 +189,55 @@ def load_config(repo_path: Path | None = None, home_dir: Path | None = None) -> 
         cfg["codex_binary"] = env_bin
 
     return cfg
+
+
+def resolve_codex_timeouts(
+    config: dict[str, Any],
+    *,
+    explicit_timeout_sec: int | None = None,
+    explicit_idle_timeout_sec: int | None = None,
+    complexity: str | None = None,
+    reasoning_effort: str | None = None,
+) -> tuple[int, int]:
+    """Resolve effective (total_timeout_sec, idle_timeout_sec) dynamically.
+
+    - Explicit caller overrides always win.
+    - Otherwise total timeout scales up using codex_timeout_by_effort and
+      codex_timeout_by_complexity (e.g., high -> 1200s) so deep reasoning runs
+      are not prematurely killed while still emitting events.
+    - Idle timeout catches genuine hangs with zero output events (0 disables).
+    """
+    if explicit_timeout_sec is not None:
+        total_timeout = max(1, int(explicit_timeout_sec))
+    else:
+        base_timeout = int(config.get("codex_timeout_sec", 600))
+        candidates = [base_timeout]
+        effort_map = config.get("codex_timeout_by_effort") or {}
+        if reasoning_effort and isinstance(effort_map, dict) and reasoning_effort in effort_map:
+            try:
+                candidates.append(int(effort_map[reasoning_effort]))
+            except (TypeError, ValueError):
+                pass
+        comp_map = config.get("codex_timeout_by_complexity") or {}
+        if complexity and isinstance(comp_map, dict) and complexity in comp_map:
+            try:
+                candidates.append(int(comp_map[complexity]))
+            except (TypeError, ValueError):
+                pass
+        total_timeout = max(1, max(candidates))
+
+    if explicit_idle_timeout_sec is not None:
+        idle_timeout = max(0, int(explicit_idle_timeout_sec))
+    else:
+        raw_idle = config.get("codex_idle_timeout_sec", 300)
+        idle_timeout = max(0, int(raw_idle)) if raw_idle is not None else 0
+        if idle_timeout > 0 and explicit_timeout_sec is not None:
+            idle_timeout = min(idle_timeout, total_timeout)
+
+    if idle_timeout > total_timeout:
+        idle_timeout = total_timeout
+
+    return total_timeout, idle_timeout
 
 
 def ensure_default_global_config(

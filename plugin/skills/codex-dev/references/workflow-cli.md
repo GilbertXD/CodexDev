@@ -10,11 +10,12 @@ All commands output structured JSON to stdout.
 
 ## Task Lifecycle
 
-- `codex-dev init --name <title> --repo <path> [--description <text>] [--complexity low|medium|high] [--model-mode auto|manual] [--model <id>] [--lock-model] [--max-repair-rounds 3] [--verify-cmd <cmd>]`
-- `codex-dev plan [--task-id <id>] (--plan-file <path|-> | --plan-text <md>) [--verify-cmd <cmd>] [--target-file <path>] [--allow-replan]`
-- `codex-dev execute [--task-id <id>] [--model <id>] [--timeout <sec>] [--escalate]`
-- `codex-dev verify [--task-id <id>] [--verify-cmd <cmd>] [--timeout <sec>]`
-- `codex-dev run-round [--task-id <id>] [--model <id>] [--codex-timeout <sec>] [--verify-cmd <cmd>] [--verify-timeout <sec>]`
+- `codex-dev init --name <title> --repo <path> [--description <text>] [--complexity low|medium|high] [--model-mode auto|manual] [--model <id>] [--lock-model] [--max-repair-rounds 3] [--verify-cmd <cmd>] [--prepare-cmd <cmd>]`
+- `codex-dev plan [--task-id <id>] (--plan-file <path|-> | --plan-text <md>) [--verify-cmd <cmd>] [--prepare-cmd <cmd>] [--target-file <path>] [--allow-replan]`
+- `codex-dev execute [--task-id <id>] [--model <id>] [--timeout <sec>] [--idle-timeout <sec>] [--escalate]`
+- `codex-dev prepare [--task-id <id>] [--prepare-cmd <cmd>] [--timeout <sec>]`
+- `codex-dev verify [--task-id <id>] [--verify-cmd <cmd>] [--prepare-cmd <cmd>] [--skip-prepare] [--timeout <sec>] [--from-failed]`
+- `codex-dev run-round [--task-id <id>] [--model <id>] [--codex-timeout <sec>] [--codex-idle-timeout <sec>] [--verify-cmd <cmd>] [--prepare-cmd <cmd>] [--skip-prepare] [--verify-timeout <sec>]`
 - `codex-dev review [--task-id <id>] --verdict <approve|request_changes|block> --summary <text> [--issue <item>]... [--feedback <text>]`
 
 ## Inspection, Control & Delivery

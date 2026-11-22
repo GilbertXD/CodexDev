@@ -92,8 +92,17 @@ def create_isolated_worktree(
     }
 
 
-def inspect_worktree_changes(worktree_path: Path, base_commit: str) -> dict[str, Any]:
-    """Inspect complete Git diff (staged + unstaged + committed on branch) and untracked files."""
+def inspect_worktree_changes(
+    worktree_path: Path,
+    base_commit: str,
+    *,
+    include_diff: bool = True,
+) -> dict[str, Any]:
+    """Inspect complete Git diff (staged + unstaged + committed on branch) and untracked files.
+
+    When include_diff=False, skips building unified diff text and omits full_diff/diff_excerpt
+    to keep summary responses compact and fast.
+    """
     wt = Path(worktree_path).resolve()
     if not wt.is_dir():
         raise GitWorktreeError(f"Worktree directory does not exist: {wt}")
@@ -189,14 +198,10 @@ def inspect_worktree_changes(worktree_path: Path, base_commit: str) -> dict[str,
             "binary": is_binary,
         }
 
-    # Full unified diff against base_commit (capped to avoid memory blowup on huge binaries)
-    diff_proc = _run_git(["diff", "--no-color", base_commit], wt)
-    unified_diff = diff_proc.stdout
-
     all_changed = sorted(set(added + modified + deleted + untracked))
     files_list = sorted(file_stats.values(), key=lambda x: x["path"])
 
-    return {
+    result: dict[str, Any] = {
         "files_changed_count": len(all_changed),
         "total_insertions": total_insertions,
         "total_deletions": total_deletions,
@@ -207,10 +212,14 @@ def inspect_worktree_changes(worktree_path: Path, base_commit: str) -> dict[str,
         "untracked": sorted(set(untracked)),
         "all_changed_files": all_changed,
         "files": files_list,
-        "diff_excerpt": unified_diff[:24000],
-        "diff_truncated": len(unified_diff) > 24000,
-        "full_diff": unified_diff,
     }
+    if include_diff:
+        diff_proc = _run_git(["diff", "--no-color", base_commit], wt)
+        unified_diff = diff_proc.stdout
+        result["diff_excerpt"] = unified_diff[:24000]
+        result["diff_truncated"] = len(unified_diff) > 24000
+        result["full_diff"] = unified_diff
+    return result
 
 
 def commit_worktree_changes(

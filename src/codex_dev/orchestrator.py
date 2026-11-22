@@ -14,6 +14,7 @@ from .config import (
     get_codex_dev_home,
     load_config,
     read_local_codex_hints,
+    resolve_codex_timeouts,
 )
 from .contract import (
     save_immutable_contract,
@@ -36,6 +37,7 @@ from .state import (
     STATE_REVIEWING,
     STATE_REVISING,
     STATE_VERIFYING,
+    StateTransitionError,
     TaskStore,
     atomic_write_json,
     atomic_write_text,
@@ -43,7 +45,7 @@ from .state import (
     read_json,
     utc_now,
 )
-from .verifier import run_independent_verification
+from .verifier import run_dependency_prepare, run_independent_verification
 from .worktree import (
     commit_worktree_changes,
     create_isolated_worktree,
@@ -154,6 +156,7 @@ class Orchestrator:
         reasoning_effort: str | None = None,
         max_repair_rounds: int | None = None,
         verify_commands: list[str] | None = None,
+        prepare_commands: list[str] | None = None,
         task_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a new task, validate model policy, and provision an isolated Git worktree."""
@@ -203,6 +206,7 @@ class Orchestrator:
             "branch": wt_info["branch"],
             "worktree_path": wt_info["worktree_path"],
             "explicit_verify_commands": verify_commands or [],
+            "explicit_prepare_commands": prepare_commands or [],
             "created_at": created_at,
         }
 
@@ -293,6 +297,7 @@ class Orchestrator:
         plan_text: str,
         *,
         verify_commands: list[str] | None = None,
+        prepare_commands: list[str] | None = None,
         target_files: list[str] | None = None,
         allow_replan: bool = False,
     ) -> dict[str, Any]:
@@ -303,10 +308,12 @@ class Orchestrator:
             state = self.store.load_state(tid)
             meta = self.store.load_task_meta(tid)
             effective_verify = verify_commands if verify_commands is not None else (meta.get("explicit_verify_commands") or None)
+            effective_prepare = prepare_commands if prepare_commands is not None else (meta.get("explicit_prepare_commands") or None)
             contract = save_immutable_contract(
                 tdir,
                 plan_text,
                 explicit_verify_commands=effective_verify,
+                explicit_prepare_commands=effective_prepare,
                 explicit_target_files=target_files,
                 allow_replan=allow_replan,
             )
@@ -339,6 +346,7 @@ class Orchestrator:
         *,
         override_model: str | None = None,
         timeout_sec: int | None = None,
+        idle_timeout_sec: int | None = None,
         escalate_model: bool = False,
     ) -> dict[str, Any]:
         """Run Codex CLI Builder inside the isolated worktree for the current round."""
@@ -388,16 +396,21 @@ class Orchestrator:
                 raise
 
             state["model_policy"]["current_model"] = selection.model
-            state["execution_attempts"] = int(state.get("execution_attempts", 0)) + 1
+            attempt_num = int(state.get("execution_attempts", 0)) + 1
+            state["execution_attempts"] = attempt_num
 
             self.store.transition(
                 tid,
                 state,
                 STATE_EXECUTING,
                 event_type="builder_started",
-                message=f"Handing off to Codex CLI Builder (round {repair_round}, model={selection.model}): {selection.reason}",
+                message=(
+                    f"Handing off to Codex CLI Builder (round {repair_round}, attempt {attempt_num}, "
+                    f"model={selection.model}): {selection.reason}"
+                ),
                 details={
                     "round": repair_round,
+                    "attempt": attempt_num,
                     "model": selection.model,
                     "mode": selection.mode,
                     "locked": selection.locked,
@@ -418,7 +431,13 @@ class Orchestrator:
                 worktree_path=worktree_path,
             )
 
-            eff_timeout = int(timeout_sec if timeout_sec is not None else cfg.get("codex_timeout_sec", 600))
+            eff_timeout, eff_idle_timeout = resolve_codex_timeouts(
+                cfg,
+                explicit_timeout_sec=timeout_sec,
+                explicit_idle_timeout_sec=idle_timeout_sec,
+                complexity=state["model_policy"].get("complexity"),
+                reasoning_effort=selection.reasoning_effort,
+            )
             codex_bin = str(cfg.get("codex_binary") or "codex")
             sandbox_mode = str(cfg.get("sandbox_mode") or "workspace-write")
 
@@ -437,6 +456,10 @@ class Orchestrator:
                 prompt=prompt,
                 timeout_sec=eff_timeout,
                 repair_round=repair_round,
+                attempt=attempt_num,
+                idle_timeout_sec=eff_idle_timeout,
+                builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
+                builder_add_dirs=cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
                 on_token_usage=_live_usage_cb,
             )
 
@@ -447,11 +470,12 @@ class Orchestrator:
                 selection=selection,
                 token_usage=outcome.token_usage,
             )
+            history_entry["attempt"] = attempt_num
             state.setdefault("model_history", []).append(history_entry)
 
             # Update diff stats snapshot after Builder run
             try:
-                diff_info = inspect_worktree_changes(worktree_path, meta["base_commit"])
+                diff_info = inspect_worktree_changes(worktree_path, meta["base_commit"], include_diff=False)
                 state["diff_stats"] = {
                     "files_changed_count": diff_info["files_changed_count"],
                     "total_insertions": diff_info["total_insertions"],
@@ -468,9 +492,11 @@ class Orchestrator:
 
             self.store.append_execution_log(
                 tid,
-                f"Builder Round {repair_round} ({selection.model})",
-                f"- Exit code: `{outcome.exit_code}` | Duration: `{outcome.duration_sec}s`\n"
-                f"- Timed out: `{outcome.timed_out}` | Cancelled: `{outcome.cancelled}`\n"
+                f"Builder Round {repair_round} Attempt {attempt_num} ({selection.model})",
+                f"- Exit code: `{outcome.exit_code}` | Duration: `{outcome.duration_sec}s` "
+                f"(timeout={eff_timeout}s, idle_timeout={eff_idle_timeout}s)\n"
+                f"- Timed out: `{outcome.timed_out}` ({outcome.timeout_reason or 'n/a'}) | Cancelled: `{outcome.cancelled}`\n"
+                f"- JSONL log: `{outcome.raw_jsonl_path}`\n"
                 f"- Selection rationale: {selection.reason}\n"
                 f"- Token usage: `{outcome.token_usage or 'unavailable'}`\n"
                 f"- Summary: {(outcome.structured_result or {}).get('summary') or outcome.error_message or 'N/A'}\n",
@@ -516,14 +542,72 @@ class Orchestrator:
             )
             return {"ok": True, "task_id": tid, "outcome": outcome.__dict__, "state": state}
 
+    def prepare_task(
+        self,
+        task_id: str | None,
+        *,
+        prepare_commands: list[str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> dict[str, Any]:
+        """Run non-sandbox dependency preparation (e.g. go mod tidy) explicitly without burning a repair round."""
+        tid = self.resolve_task_id(task_id)
+        tdir = self.store.task_dir(tid)
+        with self.store.acquire_write_lock(tid):
+            meta = self.store.load_task_meta(tid)
+            state = self.store.load_state(tid)
+            cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
+            explicit_prep = (
+                prepare_commands
+                if prepare_commands is not None
+                else (meta.get("explicit_prepare_commands") or None)
+            )
+            prep_report = run_dependency_prepare(
+                task_dir=tdir,
+                worktree_path=Path(meta["worktree_path"]),
+                base_commit=meta["base_commit"],
+                config=cfg,
+                explicit_commands=explicit_prep,
+                timeout_sec=timeout_sec,
+            )
+            if prep_report["ran"]:
+                self.store.append_event(
+                    tid,
+                    phase="verify",
+                    agent="Orchestrator (Verifier)",
+                    event_type="prepare_completed" if prep_report["passed"] else "prepare_failed",
+                    message=(
+                        f"Dependency preparation {'passed' if prep_report['passed'] else 'failed'} "
+                        f"({prep_report['commands_passed']}/{prep_report['commands_total']} commands, source={prep_report['command_source']})."
+                    ),
+                    details={
+                        "commands_passed": prep_report["commands_passed"],
+                        "commands_total": prep_report["commands_total"],
+                        "source": prep_report["command_source"],
+                    },
+                )
+                self.store.append_execution_log(
+                    tid,
+                    f"Dependency Preparation ({'PASSED' if prep_report['passed'] else 'FAILED'})",
+                    f"- Source: `{prep_report['command_source']}` | Passed: `{prep_report['commands_passed']}/{prep_report['commands_total']}`\n"
+                    + (
+                        "- Failures:\n" + "\n".join(f"  - {r}" for r in prep_report["failure_reasons"]) + "\n"
+                        if prep_report["failure_reasons"]
+                        else ""
+                    ),
+                )
+            return {"ok": prep_report["passed"], "task_id": tid, "report": prep_report, "state": state}
+
     def verify_task(
         self,
         task_id: str | None,
         *,
         verify_commands: list[str] | None = None,
+        prepare_commands: list[str] | None = None,
+        skip_prepare: bool = False,
         timeout_sec: int | None = None,
+        from_failed: bool = False,
     ) -> dict[str, Any]:
-        """Run independent verification against the worktree and transition state accordingly."""
+        """Run non-sandbox dependency preparation (if needed) and independent verification."""
         tid = self.resolve_task_id(task_id)
         tdir = self.store.task_dir(tid)
 
@@ -533,14 +617,41 @@ class Orchestrator:
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
 
             if state["status"] != STATE_VERIFYING:
+                allow_from_failed = False
+                ev_type = "verification_started"
+                ev_msg = "Starting independent verification."
+                if state["status"] == STATE_FAILED and from_failed:
+                    if state.get("failure_category") != "timeout":
+                        raise StateTransitionError(
+                            "verify --from-failed is only permitted when failure_category == 'timeout' "
+                            f"(current failure_category={state.get('failure_category')!r})."
+                        )
+                    wt_diff = inspect_worktree_changes(
+                        Path(meta["worktree_path"]), meta["base_commit"], include_diff=False
+                    )
+                    if wt_diff["files_changed_count"] <= 0:
+                        raise StateTransitionError(
+                            "verify --from-failed refused: isolated worktree has no modified or untracked files to verify."
+                        )
+                    allow_from_failed = True
+                    ev_type = "verification_started_from_failed"
+                    ev_msg = (
+                        "Architect explicitly invoked verification on worktree artifacts after timeout "
+                        f"({wt_diff['files_changed_count']} changed files)."
+                    )
                 self.store.transition(
                     tid,
                     state,
                     STATE_VERIFYING,
-                    event_type="verification_started",
-                    message="Starting independent verification.",
+                    event_type=ev_type,
+                    message=ev_msg,
+                    allow_failed_to_verify=allow_from_failed,
                 )
             else:
+                state["failure_category"] = None
+                state["last_error"] = None
+                state["verification_summary"] = None
+                self.store.save_state(tid, state)
                 self.store.append_event(
                     tid,
                     phase="verify",
@@ -548,6 +659,81 @@ class Orchestrator:
                     event_type="verification_started",
                     message="Running independent verification commands and diff integrity audit.",
                 )
+
+            # Remove stale verification.json from any previous round so readers never render outdated checks
+            stale_ver = tdir / "verification.json"
+            if stale_ver.is_file():
+                try:
+                    stale_ver.unlink()
+                except OSError:
+                    pass
+
+            # Non-sandbox dependency preparation (e.g. go mod tidy when go.mod changed)
+            prep_report: dict[str, Any] | None = None
+            extra_allowed_files: list[str] = []
+            if not skip_prepare:
+                explicit_prep = (
+                    prepare_commands
+                    if prepare_commands is not None
+                    else (meta.get("explicit_prepare_commands") or None)
+                )
+                prep_report = run_dependency_prepare(
+                    task_dir=tdir,
+                    worktree_path=Path(meta["worktree_path"]),
+                    base_commit=meta["base_commit"],
+                    config=cfg,
+                    explicit_commands=explicit_prep,
+                )
+                if prep_report["ran"]:
+                    extra_allowed_files = list(prep_report.get("generated_allowed_files") or [])
+                    self.store.append_event(
+                        tid,
+                        phase="verify",
+                        agent="Orchestrator (Verifier)",
+                        event_type="prepare_completed" if prep_report["passed"] else "prepare_failed",
+                        message=(
+                            f"Non-sandbox dependency preparation {'passed' if prep_report['passed'] else 'failed'} "
+                            f"({prep_report['commands_passed']}/{prep_report['commands_total']}, source={prep_report['command_source']})."
+                        ),
+                        details={
+                            "source": prep_report["command_source"],
+                            "commands_passed": prep_report["commands_passed"],
+                            "commands_total": prep_report["commands_total"],
+                        },
+                    )
+                    self.store.append_execution_log(
+                        tid,
+                        f"Dependency Preparation ({'PASSED' if prep_report['passed'] else 'FAILED'})",
+                        f"- Source: `{prep_report['command_source']}` | Passed: `{prep_report['commands_passed']}/{prep_report['commands_total']}`\n"
+                        + (
+                            "- Failures:\n" + "\n".join(f"  - {r}" for r in prep_report["failure_reasons"]) + "\n"
+                            if prep_report["failure_reasons"]
+                            else ""
+                        ),
+                    )
+                    if not prep_report["passed"]:
+                        err_msg = "; ".join(prep_report["failure_reasons"])[:800] or "Dependency preparation failed."
+                        # Do NOT burn a code-repair round on external dependency/network preparation errors
+                        self.store.transition(
+                            tid,
+                            state,
+                            STATE_BLOCKED,
+                            event_type="dependency_prepare_blocked",
+                            message=(
+                                f"Dependency preparation failed outside sandbox (repair round not consumed): {err_msg}"
+                            ),
+                            failure_category="dependency_prepare_failure",
+                            last_error=err_msg,
+                            details={"prepare": prep_report},
+                        )
+                        return {
+                            "ok": False,
+                            "next_action": "blocked_dependency_prepare",
+                            "task_id": tid,
+                            "prepare": prep_report,
+                            "report": None,
+                            "state": state,
+                        }
 
             eff_timeout = int(timeout_sec if timeout_sec is not None else cfg.get("verify_timeout_sec", 300))
             explicit_cmds = verify_commands if verify_commands is not None else (meta.get("explicit_verify_commands") or None)
@@ -559,6 +745,8 @@ class Orchestrator:
                 config=cfg,
                 explicit_commands=explicit_cmds,
                 timeout_sec=eff_timeout,
+                extra_allowed_files=extra_allowed_files,
+                prepare_report=prep_report if (prep_report and prep_report["ran"]) else None,
             )
 
             state["diff_stats"] = report["diff_stats"]
@@ -666,14 +854,18 @@ class Orchestrator:
         *,
         override_model: str | None = None,
         codex_timeout_sec: int | None = None,
+        codex_idle_timeout_sec: int | None = None,
         verify_commands: list[str] | None = None,
+        prepare_commands: list[str] | None = None,
+        skip_prepare: bool = False,
         verify_timeout_sec: int | None = None,
     ) -> dict[str, Any]:
-        """Run one deterministic Execute -> Verify cycle."""
+        """Run one deterministic Execute -> Prepare -> Verify cycle."""
         exec_res = self.execute_round(
             task_id,
             override_model=override_model,
             timeout_sec=codex_timeout_sec,
+            idle_timeout_sec=codex_idle_timeout_sec,
         )
         if not exec_res["ok"]:
             return {
@@ -689,6 +881,8 @@ class Orchestrator:
         ver_res = self.verify_task(
             exec_res["task_id"],
             verify_commands=verify_commands,
+            prepare_commands=prepare_commands,
+            skip_prepare=skip_prepare,
             timeout_sec=verify_timeout_sec,
         )
         return {
@@ -923,7 +1117,7 @@ class Orchestrator:
         meta = self.store.load_task_meta(tid)
         state = self.store.load_state(tid)
         wt = Path(meta["worktree_path"])
-        diff_info = inspect_worktree_changes(wt, meta["base_commit"])
+        diff_info = inspect_worktree_changes(wt, meta["base_commit"], include_diff=False)
 
         if not confirm_commit:
             return {
@@ -994,11 +1188,15 @@ class Orchestrator:
             "reviews": reviews,
         }
 
-    def get_diff(self, task_id: str | None = None) -> dict[str, Any]:
-        """Read-only full diff inspection inside task worktree."""
+    def get_diff(self, task_id: str | None = None, *, include_diff: bool = True) -> dict[str, Any]:
+        """Read-only diff inspection inside task worktree (summary-only when include_diff=False)."""
         tid = self.resolve_task_id(task_id)
         meta = self.store.load_task_meta(tid)
-        return inspect_worktree_changes(Path(meta["worktree_path"]), meta["base_commit"])
+        return inspect_worktree_changes(
+            Path(meta["worktree_path"]),
+            meta["base_commit"],
+            include_diff=include_diff,
+        )
 
     def ensure_config(self, overwrite: bool = False) -> Path:
         return ensure_default_global_config(home_dir=self.home_dir, overwrite=overwrite)

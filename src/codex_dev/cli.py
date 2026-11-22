@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--reasoning-effort", default=None, help="Codex reasoning effort override (low/medium/high).")
     ip.add_argument("--max-repair-rounds", type=int, default=None, help="Maximum automatic repair rounds (default: 3).")
     ip.add_argument("--verify-cmd", action="append", default=None, help="Explicit independent verification command (repeatable).")
+    ip.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox dependency preparation command (repeatable).")
     ip.add_argument("--task-id", default=None, help="Optional custom task ID.")
 
     # plan
@@ -70,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--plan-file", default=None, help="Path to PLAN.md file (or '-' for stdin).")
     pp.add_argument("--plan-text", default=None, help="Inline PLAN.md markdown text.")
     pp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command (repeatable).")
+    pp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox prepare command (repeatable).")
     pp.add_argument("--target-file", action="append", default=None, help="Expected file/dir scope (repeatable).")
     pp.add_argument("--allow-replan", action="store_true", help="Explicitly replace existing plan contract.")
 
@@ -77,21 +79,38 @@ def build_parser() -> argparse.ArgumentParser:
     ep = sub.add_parser("execute", help="Run Codex CLI Builder for the current round.")
     ep.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     ep.add_argument("--model", default=None, help="Optional per-round authorized model override (if unlocked).")
-    ep.add_argument("--timeout", type=int, default=None, help="Codex execution timeout in seconds.")
+    ep.add_argument("--timeout", type=int, default=None, help="Total Codex execution timeout in seconds.")
+    ep.add_argument("--idle-timeout", type=int, default=None, help="Idle no-event timeout in seconds (0 disables).")
     ep.add_argument("--escalate", action="store_true", help="Request authorized model escalation if unlocked.")
 
+    # prepare
+    prp = sub.add_parser("prepare", help="Run non-sandbox dependency preparation (e.g. go mod tidy) explicitly.")
+    prp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
+    prp.add_argument("--prepare-cmd", action="append", default=None, help="Override preparation commands (repeatable).")
+    prp.add_argument("--timeout", type=int, default=None, help="Per-command timeout in seconds.")
+
     # verify
-    vp = sub.add_parser("verify", help="Run independent verification & integrity audit.")
+    vp = sub.add_parser("verify", help="Run non-sandbox dependency preparation and independent verification.")
     vp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     vp.add_argument("--verify-cmd", action="append", default=None, help="Override verification commands.")
+    vp.add_argument("--prepare-cmd", action="append", default=None, help="Override non-sandbox prepare commands.")
+    vp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
     vp.add_argument("--timeout", type=int, default=None, help="Per-command timeout in seconds.")
+    vp.add_argument(
+        "--from-failed",
+        action="store_true",
+        help="Explicitly allow verifying existing worktree changes when FAILED due to timeout.",
+    )
 
     # run-round
-    rrp = sub.add_parser("run-round", help="Execute Builder and immediately run independent verification.")
+    rrp = sub.add_parser("run-round", help="Execute Builder, prepare dependencies outside sandbox, and verify.")
     rrp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     rrp.add_argument("--model", default=None, help="Optional per-round authorized model override.")
-    rrp.add_argument("--codex-timeout", type=int, default=None, help="Codex timeout in seconds.")
+    rrp.add_argument("--codex-timeout", type=int, default=None, help="Total Codex timeout in seconds.")
+    rrp.add_argument("--codex-idle-timeout", type=int, default=None, help="Codex idle no-event timeout in seconds (0 disables).")
     rrp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command.")
+    rrp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox prepare command.")
+    rrp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
     rrp.add_argument("--verify-timeout", type=int, default=None, help="Verification command timeout in seconds.")
 
     # review
@@ -165,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                 reasoning_effort=args.reasoning_effort,
                 max_repair_rounds=args.max_repair_rounds,
                 verify_commands=args.verify_cmd,
+                prepare_commands=args.prepare_cmd,
                 task_id=args.task_id,
             )
             _print_json(res)
@@ -176,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.task_id,
                 plan_text,
                 verify_commands=args.verify_cmd,
+                prepare_commands=args.prepare_cmd,
                 target_files=args.target_file,
                 allow_replan=args.allow_replan,
             )
@@ -187,7 +208,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.task_id,
                 override_model=args.model,
                 timeout_sec=args.timeout,
+                idle_timeout_sec=args.idle_timeout,
                 escalate_model=args.escalate,
+            )
+            _print_json(res)
+            return 0 if res["ok"] else 2
+
+        if args.command == "prepare":
+            res = orch.prepare_task(
+                args.task_id,
+                prepare_commands=args.prepare_cmd,
+                timeout_sec=args.timeout,
             )
             _print_json(res)
             return 0 if res["ok"] else 2
@@ -196,7 +227,10 @@ def main(argv: list[str] | None = None) -> int:
             res = orch.verify_task(
                 args.task_id,
                 verify_commands=args.verify_cmd,
+                prepare_commands=args.prepare_cmd,
+                skip_prepare=args.skip_prepare,
                 timeout_sec=args.timeout,
+                from_failed=args.from_failed,
             )
             _print_json(res)
             return 0 if res["ok"] else 2
@@ -206,7 +240,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.task_id,
                 override_model=args.model,
                 codex_timeout_sec=args.codex_timeout,
+                codex_idle_timeout_sec=args.codex_idle_timeout,
                 verify_commands=args.verify_cmd,
+                prepare_commands=args.prepare_cmd,
+                skip_prepare=args.skip_prepare,
                 verify_timeout_sec=args.verify_timeout,
             )
             _print_json(res)
@@ -241,9 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "diff":
-            diff = orch.get_diff(args.task_id)
-            if args.summary_only:
-                diff = {k: v for k, v in diff.items() if k != "full_diff"}
+            diff = orch.get_diff(args.task_id, include_diff=not args.summary_only)
             _print_json(diff)
             return 0
 

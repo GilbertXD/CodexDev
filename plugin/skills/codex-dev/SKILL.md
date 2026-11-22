@@ -75,7 +75,8 @@ Check the returned JSON `next_action`:
 - `review_required` → Proceed to **Step 4 (Code Review)**.
 - `repair_available` → Verification failed; `FEEDBACK.md` was generated automatically. Inspect the failure, enrich `FEEDBACK.md` if needed, and re-run `codex-dev run-round --task-id <task_id>` (up to 3 total repair rounds).
 - `blocked_retry_limit` → Max repair rounds (3) reached. Stop and report diagnostics clearly to the user.
-- `failed` or `blocked` → Inspect `state.failure_category` (`execution_failure`, `timeout`, `cancelled`, `invalid_model`, `contract_violation`) and report clearly to the user.
+- `blocked_dependency_prepare` → Non-sandbox dependency preparation (e.g., `go mod tidy` after `go.mod` edits) failed (`failure_category == "dependency_prepare_failure"`). Repair rounds were **not** consumed; inspect network/proxy config (e.g., `verify.env.GOPROXY` in `~/.codex-dev/config.json`) or dependency versions and re-run `codex-dev verify` once resolved.
+- `failed` or `blocked` → Inspect `state.failure_category` (`execution_failure`, `builder_blocked`, `timeout`, `cancelled`, `invalid_model`, `contract_violation`, `dependency_prepare_failure`). If `failure_category == "timeout"` and `codex-dev diff --summary-only` shows the Builder already wrote substantial changes to the worktree, you may explicitly run `codex-dev verify --task-id <task_id> --from-failed` to verify existing worktree artifacts without re-running the Builder; otherwise report clearly to the user.
 
 ### Step 4 — Semantic Code Review (Antigravity as Reviewer)
 When state is `REVIEWING`:

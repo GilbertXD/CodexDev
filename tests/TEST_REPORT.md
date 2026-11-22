@@ -18,7 +18,7 @@ Command:
 python3 -m unittest tests/test_orchestrator.py -v
 ```
 
-Result: **8/8 PASSED** (`0` failures, `0` warnings, `~7.6s`).
+Result: **16/16 PASSED** (`0` failures, `0` warnings).
 
 | Test Case | Verified Capabilities | Result |
 | :--- | :--- | :--- |
@@ -30,6 +30,14 @@ Result: **8/8 PASSED** (`0` failures, `0` warnings, `~7.6s`).
 | `test_06_immutable_contract_tamper_and_test_weakening_audit` | Anti-weakening audit blocks `@unittest.skip` insertion; SHA-256 tamper check rejects modified `PLAN.md` (`contract_violation`) before Builder runs | PASS |
 | `test_07_concurrent_writer_lock_and_live_cancel` | Advisory `fcntl.flock` rejects concurrent writer (`TaskLockError`); live `cancel_task` terminates running process group and transitions to `BLOCKED` (`cancelled`) | PASS |
 | `test_08_stack_agnostic_node_verification` | Auto-detects and executes `npm run test` on a Node.js repository without language hardcoding | PASS |
+| `test_09_dotfile_target_paths_preserved_without_false_unexpected_files` | `normalize_target_path` strips only `./` and leading `/`, preserving `.gitignore`, `.env.example`, `.dockerignore`, `.github/workflows/ci.yml` with zero false `unexpected_files` | PASS |
+| `test_10_dynamic_timeout_idle_timeout_and_attempt_log_preservation` | Dynamic timeout scaling for `high` effort/complexity (`1200s`), idle no-event timeout vs active event streaming, and per-attempt `codex_round_<r>_attempt_<a>.jsonl` log preservation | PASS |
+| `test_11_sandbox_prompt_guidance` | `build_codex_prompt` keeps `workspace-write` sandbox while instructing Builder not to work around network/port/Docker restrictions and deferring to external verifier | PASS |
+| `test_12_verify_from_failed_guarded_transition` | Guarded `verify --from-failed` permits `FAILED -> VERIFYING` only when `failure_category == "timeout"` and worktree has changes; default and non-timeout/empty cases remain rejected | PASS |
+| `test_13_builder_gocache_add_dir_and_model_refresh_noise_suppression` | Auto-provisions task-scoped writable `GOCACHE`/`GOTMPDIR` via `--add-dir` and `shell_environment_policy.set`, disables `api_key_model_discovery` & startup update check, and collapses benign model-refresh timeout stderr noise | PASS |
+| `test_14_non_sandbox_dependency_prepare_env_and_failure_isolation` | Auto-detects `go mod tidy` when `go.mod` changes, passes `verify.env`/`prepare.env` (e.g. `GOPROXY`) to host Prepare & Verify stages, and blocks on `dependency_prepare_failure` without consuming a `repair_round` | PASS |
+| `test_15_diff_summary_only_omits_diff_body` | `codex-dev diff --summary-only` skips unified diff generation and omits both `full_diff` and `diff_excerpt` | PASS |
+| `test_16_verifying_clears_stale_error_and_verification_summary` | Entering/re-entering `VERIFYING` immediately clears `last_error`, `failure_category`, `verification_summary`, and removes stale `verification.json` so Monitor renders clean running state | PASS |
 
 ---
 

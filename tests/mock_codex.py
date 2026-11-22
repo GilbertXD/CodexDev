@@ -29,6 +29,8 @@ def main() -> int:
     parser.add_argument("--output-schema", default=None)
     parser.add_argument("-o", "--output-last-message", required=True)
     parser.add_argument("--ephemeral", action="store_true")
+    parser.add_argument("--disable", action="append", default=[])
+    parser.add_argument("--add-dir", action="append", default=[])
     parser.add_argument("-c", "--config", action="append", default=[])
     parser.add_argument("prompt_arg", nargs="?", default="-")
     args = parser.parse_args(sys.argv[2:])
@@ -51,6 +53,11 @@ def main() -> int:
                 "cd": str(wt),
                 "has_feedback": "REPAIR ROUND" in prompt,
                 "prompt_len": len(prompt),
+                "add_dirs": args.add_dir,
+                "disabled": args.disable,
+                "configs": args.config,
+                "env_gocache": os.environ.get("GOCACHE"),
+                "env_gotmpdir": os.environ.get("GOTMPDIR"),
             }
         )
         rec_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
@@ -68,6 +75,22 @@ def main() -> int:
         time.sleep(30)
         return 0
 
+    if scenario == "timeout_after_write":
+        # Builder writes valid working code, emits event, then times out before exiting
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        emit(
+            {
+                "type": "item.completed",
+                "item": {"type": "file_change", "changes": [{"path": "calc.py"}]},
+            }
+        )
+        time.sleep(30)
+        return 0
+
     if scenario == "crash":
         emit({"type": "error", "message": "Simulated Codex fatal runtime crash"})
         sys.stderr.write("Fatal: simulated unexpected termination\n")
@@ -75,7 +98,61 @@ def main() -> int:
 
     is_repair = "REPAIR ROUND" in prompt
 
-    if scenario == "success":
+    if scenario == "active_then_success":
+        # Emits heartbeat events every 0.35s for ~1.4s (exceeds a 1s idle timeout ONLY if idle is broken!)
+        for i in range(4):
+            emit(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"Progress step {i + 1}"},
+                }
+            )
+            time.sleep(0.35)
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Finished cleanly while streaming active events."
+    elif scenario == "dotfiles_success":
+        (wt / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+        (wt / ".env.example").write_text("PORT=8080\n", encoding="utf-8")
+        (wt / ".dockerignore").write_text(".git\n", encoding="utf-8")
+        (wt / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+        (wt / ".github" / "workflows" / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Updated dotfiles and calc.py."
+    elif scenario == "stderr_noise_success":
+        for _ in range(5):
+            sys.stderr.write(
+                "2026-11-22T03:11:30Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out\n"
+            )
+        sys.stderr.write("warning: real non-benign notice\n")
+        sys.stderr.flush()
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Succeeded despite benign model refresh stderr noise."
+    elif scenario == "large_diff":
+        lines = [f"LINE_{i:04d} = '{'x' * 80}'" for i in range(400)]
+        (wt / "big_data.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Wrote large file for diff summary test."
+    elif scenario == "go_mod_change":
+        (wt / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n", encoding="utf-8")
+        (wt / "main.go").write_text("package main\n\nfunc main() {}\n", encoding="utf-8")
+        summary = "Updated go.mod and main.go."
+    elif scenario == "success":
         (wt / "calc.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b\n\n"
             "def multiply(a: int, b: int) -> int:\n    return a * b\n",

@@ -50,6 +50,192 @@ def is_config_file(path: str) -> bool:
     return any(p.search(path) for p in CONFIG_FILE_PATTERNS)
 
 
+def _normalize_cmd_list(cmds: list[Any], default_kind: str = "custom", prefix: str = "check") -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for idx, item in enumerate(cmds, 1):
+        if isinstance(item, str) and item.strip():
+            out.append({"name": f"{prefix}-{idx}", "command": item.strip(), "kind": default_kind})
+        elif isinstance(item, dict) and isinstance(item.get("command"), str) and item["command"].strip():
+            out.append(
+                {
+                    "name": str(item.get("name") or f"{prefix}-{idx}"),
+                    "command": item["command"].strip(),
+                    "kind": str(item.get("kind") or default_kind),
+                }
+            )
+    return out
+
+
+def build_stage_env(config: dict[str, Any], stage: str) -> dict[str, str]:
+    """Build host subprocess environment with configured verify/prepare overrides (e.g. GOPROXY)."""
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    verify_env = (config.get("verify") or {}).get("env")
+    if isinstance(verify_env, dict):
+        for k, v in verify_env.items():
+            if isinstance(k, str) and k.strip() and v is not None:
+                env[k.strip()] = str(v)
+    if stage == "prepare":
+        prep_env = (config.get("prepare") or {}).get("env")
+        if isinstance(prep_env, dict):
+            for k, v in prep_env.items():
+                if isinstance(k, str) and k.strip() and v is not None:
+                    env[k.strip()] = str(v)
+    return env
+
+
+def detect_prepare_commands(
+    worktree_path: Path,
+    diff_info: dict[str, Any],
+    config: dict[str, Any],
+    contract: dict[str, Any] | None = None,
+    explicit_commands: list[str] | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    """Resolve non-sandbox dependency preparation commands (e.g. go mod tidy when go.mod changed)."""
+    prep_cfg = config.get("prepare") or {}
+    if not bool(prep_cfg.get("enabled", True)) and not explicit_commands:
+        return ("disabled", [])
+
+    if explicit_commands:
+        return ("explicit", _normalize_cmd_list(explicit_commands, default_kind="prepare", prefix="prepare"))
+
+    if contract and contract.get("prepare_commands"):
+        norm = _normalize_cmd_list(contract["prepare_commands"], default_kind="prepare", prefix="prepare")
+        if norm:
+            return ("plan_contract", norm)
+
+    if isinstance(prep_cfg, dict) and prep_cfg.get("commands"):
+        norm = _normalize_cmd_list(prep_cfg["commands"], default_kind="prepare", prefix="prepare")
+        if norm:
+            return ("config", norm)
+
+    detected: list[dict[str, str]] = []
+    auto_go_tidy = bool(prep_cfg.get("auto_go_mod_tidy", True)) if isinstance(prep_cfg, dict) else True
+    changed_files = set(diff_info.get("all_changed_files") or [])
+    if auto_go_tidy:
+        # Handle root go.mod or nested module go.mod files touched by the Builder
+        go_mods = sorted(
+            f for f in changed_files if (f == "go.mod" or f.endswith("/go.mod")) and (worktree_path / f).is_file()
+        )
+        for gm in go_mods:
+            mod_dir = str(Path(gm).parent)
+            if mod_dir in ("", "."):
+                detected.append({"name": "go:mod-tidy", "command": "go mod tidy", "kind": "prepare"})
+            else:
+                detected.append(
+                    {
+                        "name": f"go:mod-tidy:{mod_dir}",
+                        "command": f"cd {json.dumps(mod_dir)} && go mod tidy",
+                        "kind": "prepare",
+                    }
+                )
+    return ("auto_detected" if detected else "none", detected)
+
+
+def run_dependency_prepare(
+    *,
+    task_dir: Path,
+    worktree_path: Path,
+    base_commit: str,
+    config: dict[str, Any],
+    explicit_commands: list[str] | None = None,
+    timeout_sec: int | None = None,
+) -> dict[str, Any]:
+    """Run non-sandbox dependency preparation commands outside Codex's offline sandbox."""
+    contract = read_json(task_dir / "contract.json")
+    diff_info = inspect_worktree_changes(worktree_path, base_commit, include_diff=False)
+    source, commands = detect_prepare_commands(
+        worktree_path,
+        diff_info,
+        config,
+        contract=contract,
+        explicit_commands=explicit_commands,
+    )
+
+    prep_cfg = config.get("prepare") or {}
+    eff_timeout = int(timeout_sec if timeout_sec is not None else prep_cfg.get("timeout_sec", 180))
+    stage_env = build_stage_env(config, "prepare")
+
+    results: list[dict[str, Any]] = []
+    passed_count = 0
+    failed_count = 0
+    generated_allowed_files: list[str] = []
+
+    for item in commands:
+        cmd_str = item["command"]
+        name = item["name"]
+        t0 = time.monotonic()
+        timed_out = False
+        try:
+            proc = subprocess.run(
+                cmd_str,
+                cwd=str(worktree_path),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=eff_timeout,
+                env=stage_env,
+            )
+            exit_code = int(proc.returncode)
+            stdout_tail = proc.stdout[-4000:] if proc.stdout else ""
+            stderr_tail = proc.stderr[-4000:] if proc.stderr else ""
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            exit_code = -1
+            stdout_tail = (
+                exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            )[-2000:]
+            stderr_tail = f"Prepare command timed out after {eff_timeout}s"
+
+        duration = round(time.monotonic() - t0, 2)
+        ok = (exit_code == 0) and not timed_out
+        if ok:
+            passed_count += 1
+            if name == "go:mod-tidy":
+                generated_allowed_files.append("go.sum")
+            elif name.startswith("go:mod-tidy:"):
+                sub = name.split("go:mod-tidy:", 1)[1]
+                generated_allowed_files.append(f"{sub}/go.sum")
+        else:
+            failed_count += 1
+
+        results.append(
+            {
+                "name": name,
+                "kind": item["kind"],
+                "command": cmd_str,
+                "passed": ok,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "duration_sec": duration,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+            }
+        )
+
+    failure_reasons = [
+        f"Prepare '{r['name']}' failed (exit={r['exit_code']}): {r['command']}"
+        + (f" — {r['stderr_tail'].splitlines()[-1][:200]}" if r["stderr_tail"].strip() else "")
+        for r in results
+        if not r["passed"]
+    ]
+
+    report = {
+        "prepared_at": utc_now(),
+        "ran": len(results) > 0,
+        "passed": failed_count == 0,
+        "command_source": source,
+        "commands_total": len(results),
+        "commands_passed": passed_count,
+        "commands_failed": failed_count,
+        "checks": results,
+        "generated_allowed_files": sorted(set(generated_allowed_files)),
+        "failure_reasons": failure_reasons,
+    }
+    if results:
+        atomic_write_json(task_dir / "prepare.json", report)
+    return report
+
+
 def detect_verification_commands(
     worktree_path: Path,
     config: dict[str, Any],
@@ -64,32 +250,17 @@ def detect_verification_commands(
       3. Repository / global config `verify.commands`
       4. Auto-detected stack commands (Node/TS, Python, Go, Rust, Makefile)
     """
-    def _normalize(cmds: list[Any]) -> list[dict[str, str]]:
-        out: list[dict[str, str]] = []
-        for idx, item in enumerate(cmds, 1):
-            if isinstance(item, str) and item.strip():
-                out.append({"name": f"check-{idx}", "command": item.strip(), "kind": "custom"})
-            elif isinstance(item, dict) and isinstance(item.get("command"), str) and item["command"].strip():
-                out.append(
-                    {
-                        "name": str(item.get("name") or f"check-{idx}"),
-                        "command": item["command"].strip(),
-                        "kind": str(item.get("kind") or "custom"),
-                    }
-                )
-        return out
-
     if explicit_commands:
-        return ("explicit", _normalize(explicit_commands))
+        return ("explicit", _normalize_cmd_list(explicit_commands, default_kind="custom", prefix="check"))
 
     if contract and contract.get("verify_commands"):
-        norm = _normalize(contract["verify_commands"])
+        norm = _normalize_cmd_list(contract["verify_commands"], default_kind="custom", prefix="check")
         if norm:
             return ("plan_contract", norm)
 
     cfg_verify = config.get("verify") or {}
     if isinstance(cfg_verify, dict) and cfg_verify.get("commands"):
-        norm = _normalize(cfg_verify["commands"])
+        norm = _normalize_cmd_list(cfg_verify["commands"], default_kind="custom", prefix="check")
         if norm:
             return ("config", norm)
 
@@ -156,6 +327,7 @@ def detect_verification_commands(
 def audit_diff_integrity(
     diff_info: dict[str, Any],
     contract: dict[str, Any] | None,
+    extra_allowed_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Audit diff for deleted/weakened tests, config tampering, and out-of-scope edits."""
     warnings: list[dict[str, Any]] = []
@@ -234,7 +406,20 @@ def audit_diff_integrity(
             )
 
     # 4. Out-of-scope file check if contract declared explicit target_files
-    target_files = (contract or {}).get("target_files") or []
+    target_files = list((contract or {}).get("target_files") or [])
+    if target_files:
+        # Automatically treat sibling go.sum as expected when go.mod is targeted or go mod tidy ran
+        for tf in list(target_files):
+            if tf == "go.mod" and "go.sum" not in target_files:
+                target_files.append("go.sum")
+            elif tf.endswith("/go.mod"):
+                sib = tf[:-len("go.mod")] + "go.sum"
+                if sib not in target_files:
+                    target_files.append(sib)
+        if extra_allowed_files:
+            for af in extra_allowed_files:
+                if af not in target_files:
+                    target_files.append(af)
     unexpected_files: list[str] = []
     if target_files:
         for fpath in diff_info.get("all_changed_files") or []:
@@ -271,12 +456,14 @@ def run_independent_verification(
     config: dict[str, Any],
     explicit_commands: list[str] | None = None,
     timeout_sec: int = 300,
+    extra_allowed_files: list[str] | None = None,
+    prepare_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute independent verification commands and full git/contract/anti-weakening audit."""
     contract = read_json(task_dir / "contract.json")
     contract_check = verify_contract_integrity(task_dir)
     diff_info = inspect_worktree_changes(worktree_path, base_commit)
-    integrity_audit = audit_diff_integrity(diff_info, contract)
+    integrity_audit = audit_diff_integrity(diff_info, contract, extra_allowed_files=extra_allowed_files)
 
     source, commands = detect_verification_commands(
         worktree_path,
@@ -288,6 +475,7 @@ def run_independent_verification(
     checks: list[dict[str, Any]] = []
     passed_count = 0
     failed_count = 0
+    verify_env = build_stage_env(config, "verify")
 
     for item in commands:
         cmd_str = item["command"]
@@ -295,7 +483,6 @@ def run_independent_verification(
         kind = item["kind"]
         t0 = time.monotonic()
         timed_out = False
-        verify_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         try:
             proc = subprocess.run(
                 cmd_str,
@@ -360,6 +547,7 @@ def run_independent_verification(
         "commands_passed": passed_count,
         "commands_failed": failed_count,
         "checks": checks,
+        "prepare": prepare_report,
         "contract_integrity": contract_check,
         "diff_audit": integrity_audit,
         "diff_stats": {

@@ -4,7 +4,34 @@
   "sandbox_mode": "workspace-write",
   "max_repair_rounds": 3,
   "codex_timeout_sec": 600,
+  "codex_idle_timeout_sec": 300,
+  "codex_timeout_by_effort": {
+    "low": 600,
+    "medium": 600,
+    "high": 1200,
+    "xhigh": 1500,
+    "max": 1800,
+    "ultra": 1800
+  },
+  "codex_timeout_by_complexity": {
+    "low": 600,
+    "medium": 600,
+    "high": 1200
+  },
   "verify_timeout_sec": 300,
+  "builder_env": {},
+  "builder_add_dirs": [],
+  "prepare": {
+    "enabled": true,
+    "auto_go_mod_tidy": true,
+    "commands": [],
+    "timeout_sec": 180,
+    "env": {}
+  },
+  "verify": {
+    "commands": [],
+    "env": {}
+  },
   "model_policy": {
     "mode": "auto",
     "locked": false,

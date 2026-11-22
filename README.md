@@ -44,6 +44,39 @@ Installed locations:
 - **Task Persistence & Worktrees**: `~/.codex-dev/tasks/` & `~/.codex-dev/worktrees/`
 - **Antigravity Plugin (Global Skill + MCP App)**: `~/.gemini/config/plugins/codex-dev/`
 
+### Recommended Antigravity Permission Setup
+
+Because `codex-dev` stores global task metadata, isolated Git worktrees, and runtime code under `~/.codex-dev/` (outside the active repository workspace), Antigravity's terminal sandbox may prompt on each new `codex-dev` subcommand unless allowlisted once. In Antigravity **Settings → Permissions**:
+
+1. Add `codex-dev` to **Command Allowlist** (so orchestrator subcommands run cleanly without repeated prompts).
+2. Add a **Permission Grant / Non-Workspace File Access** allowance for `~/.codex-dev` (preserving strict workspace sandboxing everywhere else).
+
+### Dependency Preparation & Environment Overrides
+
+Codex CLI runs inside `-s workspace-write` (offline) with an automatic writable `GOCACHE`/`GOTMPDIR` under `~/.codex-dev/tasks/<task_id>/` (passed via `--add-dir` and `shell_environment_policy.set`) so Go `vet`/`build`/`test` work inside the sandbox without polluting the worktree.
+
+When a task introduces new third-party dependencies (for example, modifying `go.mod`), the Orchestrator runs a non-sandbox **Prepare** step (`auto_go_mod_tidy: true` by default, or explicit `prepare.commands` / `## Prepare Commands` / `--prepare-cmd`) before independent verification. Prepare failures transition to `BLOCKED` (`dependency_prepare_failure`) without consuming a code-repair round.
+
+You can pass environment overrides (such as `GOPROXY`) to Verify and Prepare stages via `~/.codex-dev/config.json` or `<repo>/.codex-dev.json`:
+
+```json
+{
+  "prepare": {
+    "enabled": true,
+    "auto_go_mod_tidy": true,
+    "commands": [],
+    "timeout_sec": 180,
+    "env": {}
+  },
+  "verify": {
+    "commands": [],
+    "env": {
+      "GOPROXY": "https://goproxy.cn,direct"
+    }
+  }
+}
+```
+
 ## Usage in Antigravity Chat
 
 In **any** Git repository open in Antigravity:

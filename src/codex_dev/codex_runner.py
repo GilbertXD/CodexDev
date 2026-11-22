@@ -34,6 +34,8 @@ class CodexRunOutcome:
     raw_jsonl_path: str
     result_file_path: str
     stderr_tail: str
+    attempt: int = 1
+    timeout_reason: str | None = None
 
 
 def build_codex_prompt(
@@ -55,6 +57,15 @@ def build_codex_prompt(
         "3. Do NOT run git commit, git push, git merge, or destructive git clean commands.",
         "4. Run relevant project tests and checks before finishing, and report accurate results.",
         "5. Return your final response strictly conforming to the provided JSON output schema.",
+        (
+            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
+            "polluting the repo). If a command hits sandbox restrictions (such as outbound network "
+            "downloads for new dependencies, local port binding like 127.0.0.1, Docker daemon "
+            "permissions, or restricted host paths), record the limitation honestly in your result "
+            "and finish—do NOT repeatedly attempt workarounds. The Orchestrator will run non-sandbox "
+            "dependency preparation (e.g. `go mod tidy`) and independent verification after you finish."
+        ),
         "",
         "=== IMMUTABLE PLAN CONTRACT ===",
         plan_text.strip(),
@@ -186,6 +197,31 @@ def _terminate_process_group(proc: subprocess.Popen[str], grace_sec: float = 3.0
                 pass
 
 
+BENIGN_STDERR_MARKERS = (
+    "codex_models_manager::manager: failed to refresh available models",
+)
+
+
+def _format_stderr_tail(chunks: list[str], *, max_lines: int = 40) -> str:
+    """Collapse repetitive benign model-refresh timeout lines while preserving all real errors."""
+    raw_lines = "".join(chunks).splitlines()
+    kept: list[str] = []
+    suppressed = 0
+    for line in raw_lines:
+        if any(marker in line for marker in BENIGN_STDERR_MARKERS):
+            suppressed += 1
+            continue
+        kept.append(line)
+    tail = kept[-max_lines:]
+    if suppressed > 0:
+        tail.append(f"[suppressed {suppressed} benign codex model-refresh timeout stderr line(s)]")
+    return "\n".join(tail).strip()
+
+
+def _toml_quote(val: str) -> str:
+    return json.dumps(str(val))
+
+
 def run_codex_exec(
     *,
     store: TaskStore,
@@ -198,19 +234,47 @@ def run_codex_exec(
     prompt: str,
     timeout_sec: int,
     repair_round: int,
+    attempt: int = 1,
+    idle_timeout_sec: int = 0,
+    builder_env: dict[str, str] | None = None,
+    builder_add_dirs: list[str] | None = None,
     on_token_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> CodexRunOutcome:
     """Execute `codex exec` non-interactively, streaming JSONL events into the task store."""
     tdir = store.task_dir(task_id)
-    round_tag = f"round_{repair_round}"
-    raw_jsonl_path = tdir / f"codex_{round_tag}.jsonl"
-    result_file_path = tdir / f"codex_{round_tag}_result.json"
+    run_tag = f"round_{repair_round}_attempt_{attempt}"
+    raw_jsonl_path = tdir / f"codex_{run_tag}.jsonl"
+    result_file_path = tdir / f"codex_{run_tag}_result.json"
     cancel_flag = tdir / ".cancel"
     if cancel_flag.exists():
         try:
             cancel_flag.unlink()
         except OSError:
             pass
+
+    # Provision writable Go build/temp cache directories outside the worktree so Go vet/test/build
+    # works cleanly inside Codex's workspace-write sandbox without polluting git status.
+    gocache_dir = (tdir / "gocache").resolve()
+    gotmp_dir = (tdir / "gotmp").resolve()
+    gocache_dir.mkdir(parents=True, exist_ok=True)
+    gotmp_dir.mkdir(parents=True, exist_ok=True)
+
+    injected_env: dict[str, str] = {
+        "GOCACHE": str(gocache_dir),
+        "GOTMPDIR": str(gotmp_dir),
+    }
+    if builder_env:
+        for k, v in builder_env.items():
+            if isinstance(k, str) and k.strip() and v is not None:
+                injected_env[k.strip()] = str(v)
+
+    add_dirs: list[str] = [str(gocache_dir), str(gotmp_dir)]
+    if builder_add_dirs:
+        for d in builder_add_dirs:
+            if isinstance(d, str) and d.strip():
+                resolved_d = str(Path(d).expanduser().resolve())
+                if resolved_d not in add_dirs:
+                    add_dirs.append(resolved_d)
 
     # Support either direct executable file path (possibly with spaces) or multi-token command (for mock testing)
     if Path(codex_binary).is_file():
@@ -232,21 +296,56 @@ def run_codex_exec(
         "-o",
         str(result_file_path),
         "--ephemeral",
+        "--disable",
+        "api_key_model_discovery",
         "-c",
         'approval_policy="never"',
+        "-c",
+        "check_for_update_on_startup=false",
     ]
+    for extra_dir in add_dirs:
+        cmd.extend(["--add-dir", extra_dir])
+    for env_k, env_v in injected_env.items():
+        cmd.extend(["-c", f"shell_environment_policy.set.{env_k}={_toml_quote(env_v)}"])
     if reasoning_effort:
         cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
     cmd.append("-")
 
+    proc_env = {**os.environ, **injected_env}
+
     start_ts = time.monotonic()
+    last_activity_ts = start_ts
+    activity_lock = threading.Lock()
+
+    def _touch_activity() -> None:
+        nonlocal last_activity_ts
+        with activity_lock:
+            last_activity_ts = time.monotonic()
+
+    def _get_last_activity() -> float:
+        with activity_lock:
+            return last_activity_ts
+
     store.append_event(
         task_id,
         phase="execute",
         agent="Codex CLI (Builder)",
         event_type="codex_invoked",
-        message=f"Starting Codex CLI (model={model}, sandbox={sandbox_mode}, round={repair_round})",
-        details={"model": model, "sandbox": sandbox_mode, "round": repair_round},
+        message=(
+            f"Starting Codex CLI (model={model}, sandbox={sandbox_mode}, "
+            f"round={repair_round}, attempt={attempt}, timeout={timeout_sec}s"
+            + (f", idle_timeout={idle_timeout_sec}s" if idle_timeout_sec > 0 else "")
+            + ")"
+        ),
+        details={
+            "model": model,
+            "sandbox": sandbox_mode,
+            "round": repair_round,
+            "attempt": attempt,
+            "timeout_sec": timeout_sec,
+            "idle_timeout_sec": idle_timeout_sec,
+            "raw_jsonl_path": str(raw_jsonl_path),
+        },
     )
 
     try:
@@ -259,6 +358,7 @@ def run_codex_exec(
             text=True,
             bufsize=1,
             start_new_session=True,
+            env=proc_env,
         )
     except FileNotFoundError as exc:
         return CodexRunOutcome(
@@ -275,6 +375,7 @@ def run_codex_exec(
             raw_jsonl_path=str(raw_jsonl_path),
             result_file_path=str(result_file_path),
             stderr_tail=str(exc),
+            attempt=attempt,
         )
 
     try:
@@ -289,6 +390,8 @@ def run_codex_exec(
         if proc.stderr is None:
             return
         for line in proc.stderr:
+            if line.strip():
+                _touch_activity()
             stderr_chunks.append(line)
             if len(stderr_chunks) > 200:
                 stderr_chunks.pop(0)
@@ -306,21 +409,29 @@ def run_codex_exec(
         pass
 
     timed_out = False
+    timeout_reason: str | None = None
     cancelled = False
     events_seen = 0
     latest_usage: dict[str, Any] | None = None
     last_error_msg: str | None = None
 
     def _watchdog() -> None:
-        nonlocal timed_out, cancelled
+        nonlocal timed_out, timeout_reason, cancelled
         deadline = start_ts + max(1, timeout_sec)
         while proc.poll() is None:
             if cancel_flag.exists():
                 cancelled = True
                 _terminate_process_group(proc)
                 return
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 timed_out = True
+                timeout_reason = "wall_clock"
+                _terminate_process_group(proc)
+                return
+            if idle_timeout_sec > 0 and (now - _get_last_activity()) >= idle_timeout_sec:
+                timed_out = True
+                timeout_reason = "idle"
                 _terminate_process_group(proc)
                 return
             time.sleep(0.2)
@@ -332,6 +443,7 @@ def run_codex_exec(
         with raw_jsonl_path.open("w", encoding="utf-8") as log_fh:
             if proc.stdout is not None:
                 for raw_line in proc.stdout:
+                    _touch_activity()
                     log_fh.write(raw_line)
                     log_fh.flush()
                     stripped = raw_line.strip()
@@ -362,12 +474,13 @@ def run_codex_exec(
                             agent="Codex CLI (Builder)",
                             event_type=ev_type,
                             message=ev_msg,
-                            details={"round": repair_round, "model": model},
+                            details={"round": repair_round, "attempt": attempt, "model": model},
                         )
 
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         timed_out = True
+        timeout_reason = timeout_reason or "wall_clock"
         _terminate_process_group(proc)
         proc.wait(timeout=5)
     finally:
@@ -386,8 +499,9 @@ def run_codex_exec(
         store.clear_run_pid(task_id)
 
     duration = round(time.monotonic() - start_ts, 2)
+    idle_since = round(max(0.0, time.monotonic() - _get_last_activity()), 1)
     exit_code = int(proc.returncode if proc.returncode is not None else -1)
-    stderr_tail = "".join(stderr_chunks[-40:]).strip()
+    stderr_tail = _format_stderr_tail(stderr_chunks)
 
     structured_result: dict[str, Any] | None = None
     if result_file_path.is_file():
@@ -403,12 +517,18 @@ def run_codex_exec(
     # Save/update canonical RESULT.json snapshot
     result_doc = {
         "round": repair_round,
+        "attempt": attempt,
         "model": model,
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "timeout_reason": timeout_reason,
+        "timeout_sec": timeout_sec,
+        "idle_timeout_sec": idle_timeout_sec,
         "cancelled": cancelled,
         "duration_sec": duration,
         "token_usage": latest_usage,
+        "raw_jsonl_path": str(raw_jsonl_path),
+        "result_file_path": str(result_file_path),
         "codex_result": structured_result,
         "stderr_tail": stderr_tail[:2000],
     }
@@ -429,16 +549,27 @@ def run_codex_exec(
             raw_jsonl_path=str(raw_jsonl_path),
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
+            attempt=attempt,
         )
 
     if timed_out:
+        if timeout_reason == "idle":
+            err_msg = (
+                f"Codex execution timed out after {idle_timeout_sec}s with no output events "
+                f"(idle timeout; total elapsed {duration}s)."
+            )
+        else:
+            err_msg = (
+                f"Codex execution timed out after {timeout_sec}s total limit "
+                f"(last event {idle_since}s ago)."
+            )
         return CodexRunOutcome(
             ok=False,
             exit_code=exit_code,
             timed_out=True,
             cancelled=False,
             failure_category="timeout",
-            error_message=f"Codex execution timed out after {timeout_sec}s.",
+            error_message=err_msg,
             duration_sec=duration,
             structured_result=structured_result,
             token_usage=latest_usage,
@@ -446,6 +577,8 @@ def run_codex_exec(
             raw_jsonl_path=str(raw_jsonl_path),
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
+            attempt=attempt,
+            timeout_reason=timeout_reason,
         )
 
     if exit_code != 0:
@@ -464,6 +597,7 @@ def run_codex_exec(
             raw_jsonl_path=str(raw_jsonl_path),
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
+            attempt=attempt,
         )
 
     if structured_result and structured_result.get("status") in ("failed", "blocked"):
@@ -482,6 +616,7 @@ def run_codex_exec(
             raw_jsonl_path=str(raw_jsonl_path),
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
+            attempt=attempt,
         )
 
     return CodexRunOutcome(
@@ -498,4 +633,5 @@ def run_codex_exec(
         raw_jsonl_path=str(raw_jsonl_path),
         result_file_path=str(result_file_path),
         stderr_tail=stderr_tail,
+        attempt=attempt,
     )

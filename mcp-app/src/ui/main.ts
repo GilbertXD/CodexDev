@@ -261,16 +261,19 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
 
   const verSummary = (state.verification_summary || null) as Record<string, unknown> | null;
   const verFull = (snapshot.verification || null) as Record<string, unknown> | null;
-  const checks: VerificationCheck[] = Array.isArray(verSummary?.checks)
-    ? (verSummary?.checks as VerificationCheck[])
-    : Array.isArray(verFull?.checks)
-      ? (verFull?.checks as VerificationCheck[])
-      : [];
+  const isVerifyingNow = status === "VERIFYING" && !verSummary;
+  const checks: VerificationCheck[] = isVerifyingNow
+    ? []
+    : Array.isArray(verSummary?.checks)
+      ? (verSummary?.checks as VerificationCheck[])
+      : Array.isArray(verFull?.checks)
+        ? (verFull?.checks as VerificationCheck[])
+        : [];
 
   const verTotal = Number(verSummary?.commands_total ?? checks.length ?? 0);
   const verPassed = Number(verSummary?.commands_passed ?? checks.filter((c) => c.passed).length ?? 0);
   const verFailed = Number(verSummary?.commands_failed ?? checks.filter((c) => !c.passed).length ?? 0);
-  const verOverall = verSummary ? (verSummary.passed ? "PASS" : "FAIL") : "WAIT";
+  const verOverall = isVerifyingNow ? "RUN" : verSummary ? (verSummary.passed ? "PASS" : "FAIL") : "WAIT";
 
   const diff = (state.diff_stats || {}) as Record<string, unknown>;
   const filesCount = Number(diff.files_changed_count ?? 0);
@@ -351,7 +354,7 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
             )
             .join("")}
         </div>`
-      : `<p class="muted-placeholder">No verification commands executed yet.</p>`;
+      : `<p class="muted-placeholder">${isVerifyingNow ? "Running independent verification…" : "No verification commands executed yet."}</p>`;
 
   const auditChips: string[] = [];
   if (verSummary) {
@@ -492,7 +495,7 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
       <div class="telemetry-cell">
         <div class="telemetry-label">Tests</div>
         <div class="telemetry-value">${esc(verOverall)}</div>
-        <div class="telemetry-sub">${verTotal > 0 ? `${verPassed} pass · ${verFailed} fail` : "Not run"}</div>
+        <div class="telemetry-sub">${isVerifyingNow ? "Running checks…" : verTotal > 0 ? `${verPassed} pass · ${verFailed} fail` : "Not run"}</div>
       </div>
       <div class="telemetry-cell">
         <div class="telemetry-label">Git Diff</div>
@@ -509,7 +512,7 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
     <section class="section">
       <div class="section-header">
         <span class="section-title">Independent Verification</span>
-        <span class="section-meta">${verSummary ? `${verPassed}/${verTotal} PASSED` : "PENDING"}</span>
+        <span class="section-meta">${isVerifyingNow ? "RUNNING" : verSummary ? `${verPassed}/${verTotal} PASSED` : "PENDING"}</span>
       </div>
       ${checksHtml}
       ${

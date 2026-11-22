@@ -214,13 +214,16 @@ class TaskStore:
         details: dict[str, Any] | None = None,
         failure_category: str | None = None,
         last_error: str | None = None,
+        allow_failed_to_verify: bool = False,
     ) -> dict[str, Any]:
         """Validate and persist a state machine transition atomically."""
         if target_status not in ALL_STATES:
             raise StateTransitionError(f"Unknown target state: {target_status}")
         current = str(state.get("status") or "")
         if current and target_status != current:
-            allowed = ALLOWED_TRANSITIONS.get(current, set())
+            allowed = set(ALLOWED_TRANSITIONS.get(current, set()))
+            if allow_failed_to_verify and current == STATE_FAILED and target_status == STATE_VERIFYING:
+                allowed.add(STATE_VERIFYING)
             if target_status not in allowed:
                 raise StateTransitionError(
                     f"Illegal state transition: {current} -> {target_status} "
@@ -283,8 +286,11 @@ class TaskStore:
 
         if last_error is not None:
             state["last_error"] = last_error
-        elif target_status in {STATE_COMPLETED, STATE_EXECUTING}:
+        elif target_status in {STATE_COMPLETED, STATE_EXECUTING, STATE_VERIFYING, STATE_REVIEWING}:
             state["last_error"] = None
+
+        if target_status in {STATE_EXECUTING, STATE_VERIFYING}:
+            state["verification_summary"] = None
 
         self.save_state(task_id, state)
         self.append_event(

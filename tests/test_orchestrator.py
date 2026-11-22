@@ -15,8 +15,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
+from codex_dev.codex_runner import build_codex_prompt
+from codex_dev.config import DEFAULT_CONFIG, resolve_codex_timeouts
+from codex_dev.contract import normalize_target_path, parse_plan_markdown
 from codex_dev.models import InvalidModelError
 from codex_dev.orchestrator import Orchestrator
+from codex_dev.verifier import detect_prepare_commands
 from codex_dev.state import (
     STATE_BLOCKED,
     STATE_COMPLETED,
@@ -25,6 +29,7 @@ from codex_dev.state import (
     STATE_PLANNED,
     STATE_REVIEWING,
     STATE_REVISING,
+    StateTransitionError,
     TaskLockError,
     atomic_write_json,
 )
@@ -406,6 +411,313 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertEqual(rr["verification"]["report"]["command_source"], "auto_detected")
         self.assertEqual(rr["verification"]["report"]["checks"][0]["name"], "npm:test")
         self.assertEqual(rr["state"]["status"], STATE_REVIEWING)
+
+    def test_09_dotfile_target_paths_preserved_without_false_unexpected_files(self) -> None:
+        self.assertEqual(normalize_target_path(".gitignore"), ".gitignore")
+        self.assertEqual(normalize_target_path("./.gitignore"), ".gitignore")
+        self.assertEqual(normalize_target_path("././.env.example"), ".env.example")
+        self.assertEqual(normalize_target_path(".dockerignore"), ".dockerignore")
+        self.assertEqual(normalize_target_path("./.github/workflows/ci.yml"), ".github/workflows/ci.yml")
+        self.assertEqual(normalize_target_path("/src/app.py"), "src/app.py")
+
+        plan_with_dotfiles = """# Plan: Dotfiles
+
+## Target Files
+- `.gitignore`
+- `./.env.example`
+- `.dockerignore`
+- `.github/workflows/ci.yml`
+- ./calc.py
+
+## Acceptance Criteria
+- Dotfiles and calc.py updated cleanly
+
+## Verification Commands
+- `python3 -m unittest discover -v`
+"""
+        parsed = parse_plan_markdown(plan_with_dotfiles)
+        self.assertEqual(
+            parsed["target_files"],
+            [".gitignore", ".env.example", ".dockerignore", ".github/workflows/ci.yml", "calc.py"],
+        )
+
+        repo = _create_python_repo(self.tmp_path)
+        os.environ["MOCK_CODEX_SCENARIO"] = "dotfiles_success"
+        tid = self.orch.init_task(name="Dotfile scope audit", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, plan_with_dotfiles)
+        rr = self.orch.run_round(tid)
+        self.assertTrue(rr["ok"])
+        audit = rr["verification"]["report"]["diff_audit"]
+        self.assertEqual(audit["unexpected_files"], [])
+        self.assertEqual(audit["warnings"], [])
+
+    def test_10_dynamic_timeout_idle_timeout_and_attempt_log_preservation(self) -> None:
+        # Dynamic timeout scales up for high reasoning_effort / complexity
+        t_low, i_low = resolve_codex_timeouts(DEFAULT_CONFIG, complexity="low", reasoning_effort="low")
+        t_high_eff, i_high_eff = resolve_codex_timeouts(DEFAULT_CONFIG, complexity="medium", reasoning_effort="high")
+        t_high_comp, _ = resolve_codex_timeouts(DEFAULT_CONFIG, complexity="high", reasoning_effort="low")
+        t_explicit, i_explicit = resolve_codex_timeouts(
+            DEFAULT_CONFIG, explicit_timeout_sec=45, complexity="high", reasoning_effort="high"
+        )
+        self.assertEqual(t_low, 600)
+        self.assertEqual(i_low, 300)
+        self.assertEqual(t_high_eff, 1200)
+        self.assertEqual(i_high_eff, 300)
+        self.assertEqual(t_high_comp, 1200)
+        self.assertEqual(t_explicit, 45)
+        self.assertEqual(i_explicit, 45)
+
+        repo = _create_python_repo(self.tmp_path)
+        tid = self.orch.init_task(name="Timeout & attempt logs", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        tdir = self.orch.store.task_dir(tid)
+
+        # Attempt 1: stalled process hits idle timeout (1s) well before wall-clock limit (10s)
+        os.environ["MOCK_CODEX_SCENARIO"] = "timeout"
+        res1 = self.orch.execute_round(tid, timeout_sec=10, idle_timeout_sec=1)
+        self.assertFalse(res1["ok"])
+        self.assertEqual(res1["state"]["status"], STATE_FAILED)
+        self.assertEqual(res1["state"]["failure_category"], "timeout")
+        self.assertEqual(res1["outcome"]["timeout_reason"], "idle")
+        self.assertEqual(res1["outcome"]["attempt"], 1)
+        attempt1_log = tdir / "codex_round_0_attempt_1.jsonl"
+        self.assertTrue(attempt1_log.is_file())
+        attempt1_content = attempt1_log.read_text(encoding="utf-8")
+        self.assertIn("sleep 60", attempt1_content)
+
+        # Attempt 2: active streaming keeps alive past 1s idle timeout and succeeds; attempt 1 log is NOT overwritten!
+        os.environ["MOCK_CODEX_SCENARIO"] = "active_then_success"
+        res2 = self.orch.execute_round(tid, timeout_sec=10, idle_timeout_sec=1)
+        self.assertTrue(res2["ok"])
+        self.assertEqual(res2["outcome"]["attempt"], 2)
+        attempt2_log = tdir / "codex_round_0_attempt_2.jsonl"
+        self.assertTrue(attempt2_log.is_file())
+        self.assertEqual(attempt1_log.read_text(encoding="utf-8"), attempt1_content)
+        self.assertIn("Progress step 4", attempt2_log.read_text(encoding="utf-8"))
+
+    def test_11_sandbox_prompt_guidance(self) -> None:
+        prompt = build_codex_prompt(
+            task_name="Demo",
+            plan_text=PLAN_PY,
+            feedback_text=None,
+            repair_round=0,
+            worktree_path=Path("/tmp/wt"),
+        )
+        self.assertIn("workspace-write", prompt)
+        self.assertIn("GOCACHE", prompt)
+        self.assertIn("127.0.0.1", prompt)
+        self.assertIn("Docker daemon", prompt)
+        self.assertIn("non-sandbox dependency preparation", prompt)
+        self.assertIn("independent verification", prompt)
+
+    def test_12_verify_from_failed_guarded_transition(self) -> None:
+        repo = _create_python_repo(self.tmp_path)
+
+        # 12A: Crash failure (non-timeout) must be rejected even with from_failed=True
+        os.environ["MOCK_CODEX_SCENARIO"] = "crash"
+        tid_crash = self.orch.init_task(name="Verify from crash rejected", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid_crash, PLAN_PY)
+        self.orch.execute_round(tid_crash)
+        with self.assertRaises(StateTransitionError):
+            self.orch.verify_task(tid_crash, from_failed=True)
+
+        # 12B: Timeout with NO worktree changes must be rejected even with from_failed=True
+        os.environ["MOCK_CODEX_SCENARIO"] = "timeout"
+        tid_empty = self.orch.init_task(name="Verify from empty timeout rejected", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid_empty, PLAN_PY)
+        self.orch.execute_round(tid_empty, timeout_sec=1)
+        with self.assertRaises(StateTransitionError):
+            self.orch.verify_task(tid_empty, from_failed=True)
+
+        # 12C: Timeout AFTER writing valid files: default verify_task fails, --from-failed succeeds!
+        os.environ["MOCK_CODEX_SCENARIO"] = "timeout_after_write"
+        tid_ok = self.orch.init_task(name="Verify from timeout artifacts", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid_ok, PLAN_PY)
+        exec_res = self.orch.execute_round(tid_ok, timeout_sec=1)
+        self.assertFalse(exec_res["ok"])
+        self.assertEqual(exec_res["state"]["status"], STATE_FAILED)
+        self.assertEqual(exec_res["state"]["failure_category"], "timeout")
+
+        # Default (from_failed=False) must still forbid FAILED -> VERIFYING
+        with self.assertRaises(StateTransitionError):
+            self.orch.verify_task(tid_ok, from_failed=False)
+
+        # Explicit Architect override (from_failed=True) verifies worktree artifacts cleanly -> REVIEWING
+        ver_res = self.orch.verify_task(tid_ok, from_failed=True)
+        self.assertTrue(ver_res["ok"])
+        self.assertEqual(ver_res["next_action"], "review_required")
+        self.assertEqual(ver_res["state"]["status"], STATE_REVIEWING)
+
+    def test_13_builder_gocache_add_dir_and_model_refresh_noise_suppression(self) -> None:
+        repo = _create_python_repo(self.tmp_path)
+        rec = self.tmp_path / "builder_flags.json"
+        os.environ["MOCK_CODEX_SCENARIO"] = "stderr_noise_success"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec)
+
+        tid = self.orch.init_task(name="GoCache & stderr noise", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        res = self.orch.execute_round(tid)
+        self.assertTrue(res["ok"])
+
+        tdir = self.orch.store.task_dir(tid)
+        expected_gocache = str((tdir / "gocache").resolve())
+        expected_gotmp = str((tdir / "gotmp").resolve())
+        calls = json.loads(rec.read_text(encoding="utf-8"))
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        self.assertEqual(c["env_gocache"], expected_gocache)
+        self.assertEqual(c["env_gotmpdir"], expected_gotmp)
+        self.assertIn(expected_gocache, c["add_dirs"])
+        self.assertIn(expected_gotmp, c["add_dirs"])
+        self.assertIn("api_key_model_discovery", c["disabled"])
+        self.assertTrue(any("check_for_update_on_startup=false" in x for x in c["configs"]))
+        self.assertTrue(any("shell_environment_policy.set.GOCACHE=" in x for x in c["configs"]))
+        self.assertTrue(any("shell_environment_policy.set.GOTMPDIR=" in x for x in c["configs"]))
+
+        # Repetitive benign model-refresh timeout lines are collapsed while real stderr lines remain
+        stderr_tail = res["outcome"]["stderr_tail"]
+        self.assertIn("warning: real non-benign notice", stderr_tail)
+        self.assertIn("suppressed 5 benign codex model-refresh timeout", stderr_tail)
+        self.assertNotIn("codex_models_manager::manager", stderr_tail)
+
+    def test_14_non_sandbox_dependency_prepare_env_and_failure_isolation(self) -> None:
+        repo = _create_python_repo(self.tmp_path)
+        # Configure verify.env / prepare.env passthrough (e.g. GOPROXY)
+        cfg_path = self.home_dir / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["verify"] = {"commands": [], "env": {"GOPROXY": "https://goproxy.cn,direct", "VERIFY_FLAG": "from_verify"}}
+        cfg["prepare"] = {
+            "enabled": True,
+            "auto_go_mod_tidy": True,
+            "commands": [],
+            "timeout_sec": 60,
+            "env": {"PREP_FLAG": "from_prepare"},
+        }
+        atomic_write_json(cfg_path, cfg)
+
+        # 14A: Auto-detection of go mod tidy when go.mod changed
+        os.environ["MOCK_CODEX_SCENARIO"] = "go_mod_change"
+        tid_go = self.orch.init_task(name="Go mod auto tidy detection", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid_go, "# Plan\n\n## Target Files\n- `go.mod`\n- `main.go`\n")
+        self.orch.execute_round(tid_go)
+        meta_go = self.orch.store.load_task_meta(tid_go)
+        wt_go = Path(meta_go["worktree_path"])
+        diff_go = self.orch.get_diff(tid_go, include_diff=False)
+        src, prep_cmds = detect_prepare_commands(wt_go, diff_go, cfg)
+        self.assertEqual(src, "auto_detected")
+        self.assertEqual(prep_cmds[0]["command"], "go mod tidy")
+
+        # 14B: Explicit prepare command receives GOPROXY + PREP_FLAG, generates go.sum without unexpected_files warning,
+        # and verify receives GOPROXY + VERIFY_FLAG
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid_ok = self.orch.init_task(
+            name="Prepare env passthrough",
+            repo_path=repo,
+            prepare_commands=[
+                'python3 -c "import os; assert os.environ.get(\'GOPROXY\')==\'https://goproxy.cn,direct\'; '
+                'assert os.environ.get(\'PREP_FLAG\')==\'from_prepare\'; open(\'prepared.ok\', \'w\').write(\'ok\')"'
+            ],
+            verify_commands=[
+                'python3 -c "import os, pathlib; assert os.environ.get(\'GOPROXY\')==\'https://goproxy.cn,direct\'; '
+                'assert os.environ.get(\'VERIFY_FLAG\')==\'from_verify\'; assert pathlib.Path(\'prepared.ok\').is_file()"',
+                "python3 -m unittest discover -v",
+            ],
+        )["task"]["task_id"]
+        self.orch.save_plan(tid_ok, PLAN_PY)
+        rr_ok = self.orch.run_round(tid_ok)
+        self.assertTrue(rr_ok["ok"])
+        self.assertEqual(rr_ok["state"]["status"], STATE_REVIEWING)
+        self.assertTrue((self.orch.store.task_dir(tid_ok) / "prepare.json").is_file())
+
+        # 14C: Failing prepare blocks task as dependency_prepare_failure WITHOUT burning a repair_round
+        tid_fail = self.orch.init_task(
+            name="Prepare failure does not burn repair round",
+            repo_path=repo,
+            prepare_commands=['python3 -c "import sys; sys.stderr.write(\'proxy unreachable\\n\'); sys.exit(1)"'],
+        )["task"]["task_id"]
+        self.orch.save_plan(tid_fail, PLAN_PY)
+        rr_fail = self.orch.run_round(tid_fail)
+        self.assertFalse(rr_fail["ok"])
+        self.assertEqual(rr_fail["next_action"], "blocked_dependency_prepare")
+        self.assertEqual(rr_fail["state"]["status"], STATE_BLOCKED)
+        self.assertEqual(rr_fail["state"]["failure_category"], "dependency_prepare_failure")
+        self.assertEqual(rr_fail["state"]["repair_round"], 0)
+
+    def test_15_diff_summary_only_omits_diff_body(self) -> None:
+        repo = _create_python_repo(self.tmp_path)
+        os.environ["MOCK_CODEX_SCENARIO"] = "large_diff"
+        tid = self.orch.init_task(name="Large diff summary test", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.execute_round(tid)
+
+        # Full diff includes diff_excerpt and full_diff (> 10 KB)
+        full_d = self.orch.get_diff(tid, include_diff=True)
+        self.assertIn("full_diff", full_d)
+        self.assertIn("diff_excerpt", full_d)
+
+        # Summary-only omits both full_diff and diff_excerpt completely
+        summary_d = self.orch.get_diff(tid, include_diff=False)
+        self.assertNotIn("full_diff", summary_d)
+        self.assertNotIn("diff_excerpt", summary_d)
+        self.assertNotIn("diff_truncated", summary_d)
+        self.assertEqual(summary_d["files_changed_count"], 2)
+        self.assertLess(len(json.dumps(summary_d)), 2000)
+
+        # Verify via CLI `diff --summary-only` directly too
+        cli_proc = subprocess.run(
+            [sys.executable, "-m", "codex_dev", "--home", str(self.home_dir), "diff", "--task-id", tid, "--summary-only"],
+            cwd=str(ROOT_DIR),
+            env={**os.environ, "PYTHONPATH": str(ROOT_DIR / "src")},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cli_data = json.loads(cli_proc.stdout)
+        self.assertNotIn("full_diff", cli_data)
+        self.assertNotIn("diff_excerpt", cli_data)
+        self.assertLess(len(cli_proc.stdout), 2000)
+
+    def test_16_verifying_clears_stale_error_and_verification_summary(self) -> None:
+        repo = _create_python_repo(self.tmp_path)
+        os.environ["MOCK_CODEX_SCENARIO"] = "timeout_after_write"
+        tid = self.orch.init_task(name="Verify rerun clears stale error", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        tdir = self.orch.store.task_dir(tid)
+
+        # Simulate previous failed state with stale last_error + stale verification.json on disk
+        res_to = self.orch.execute_round(tid, timeout_sec=1)
+        self.assertEqual(res_to["state"]["status"], STATE_FAILED)
+        self.assertIsNotNone(res_to["state"]["last_error"])
+        atomic_write_json(
+            tdir / "verification.json",
+            {"passed": False, "checks": [{"name": "old", "command": "old", "passed": False, "exit_code": 1}]},
+        )
+
+        # Run a verify command that inspects state.json and verification.json WHILE verify is in flight
+        mid_check_file = self.tmp_path / "mid_verify_snapshot.json"
+        probe_cmd = (
+            f"python3 -c \"import json, pathlib; "
+            f"tdir = pathlib.Path({str(tdir)!r}); "
+            f"st = json.loads((tdir / 'state.json').read_text()); "
+            f"out = {{'status': st['status'], 'last_error': st['last_error'], "
+            f"'failure_category': st['failure_category'], 'verification_summary': st['verification_summary'], "
+            f"'ver_file_exists': (tdir / 'verification.json').exists()}}; "
+            f"pathlib.Path({str(mid_check_file)!r}).write_text(json.dumps(out))\""
+        )
+        ver_res = self.orch.verify_task(
+            tid,
+            verify_commands=[probe_cmd, "python3 -m unittest discover -v"],
+            from_failed=True,
+        )
+        self.assertTrue(ver_res["ok"])
+        self.assertEqual(ver_res["state"]["status"], STATE_REVIEWING)
+
+        mid = json.loads(mid_check_file.read_text(encoding="utf-8"))
+        self.assertEqual(mid["status"], "VERIFYING")
+        self.assertIsNone(mid["last_error"])
+        self.assertIsNone(mid["failure_category"])
+        self.assertIsNone(mid["verification_summary"])
+        self.assertFalse(mid["ver_file_exists"])
 
 
 if __name__ == "__main__":
