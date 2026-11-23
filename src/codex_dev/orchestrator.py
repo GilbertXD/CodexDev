@@ -26,6 +26,7 @@ from .models import (
     DISALLOWED_EFFORTS,
     InvalidModelError,
     make_model_history_entry,
+    promote_policy_for_plan_scope,
     resolve_task_model_policy,
     select_model_for_round,
 )
@@ -463,6 +464,16 @@ class Orchestrator:
             )
             state["contract_sha256"] = contract["plan_sha256"]
             state["acceptance_criteria"] = contract["acceptance_criteria"]
+
+            cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
+            hints = read_local_codex_hints()
+            promotion = promote_policy_for_plan_scope(
+                state["model_policy"],
+                cfg,
+                contract,
+                cached_models=hints.get("cached_models") or None,
+            )
+
             self.store.transition(
                 tid,
                 state,
@@ -475,14 +486,31 @@ class Orchestrator:
                     "target_files": contract["target_files"],
                 },
             )
+            if promotion.get("promoted"):
+                self.store.append_event(
+                    tid,
+                    phase="plan",
+                    agent="Orchestrator",
+                    event_type="plan_scope_promoted",
+                    message=str(promotion.get("reason") or "Promoted task model policy based on PLAN.md scope."),
+                    details=promotion,
+                )
             self.store.append_execution_log(
                 tid,
                 "Plan Contract Locked",
                 f"- SHA-256: `{contract['plan_sha256']}`\n"
                 f"- Acceptance criteria: {len(contract['acceptance_criteria'])}\n"
-                f"- Target files: {', '.join(contract['target_files']) or '(unspecified)'}\n",
+                f"- Target files: {', '.join(contract['target_files']) or '(unspecified)'}\n"
+                + (
+                    f"- Scope auto-promotion: {promotion['reason']}\n"
+                    if promotion.get("promoted")
+                    else ""
+                ),
             )
-            return {"task_id": tid, "contract": contract, "state": state}
+            res: dict[str, Any] = {"task_id": tid, "contract": contract, "state": state}
+            if promotion.get("promoted"):
+                res["plan_scope_promotion"] = promotion
+            return res
 
     def execute_round(
         self,

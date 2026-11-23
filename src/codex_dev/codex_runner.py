@@ -177,16 +177,17 @@ def build_codex_prompt(
     """Build deterministic builder instructions for Codex CLI."""
     if builder_network_access:
         sandbox_rule = (
-            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "7. You are running inside a `workspace-write` sandbox with a pre-configured writable "
             "`GOCACHE`/`GOTMPDIR` outside the worktree and `sandbox_workspace_write.network_access=true` "
             "(so local loopback servers like 127.0.0.1 and local backing services are reachable, while "
             "filesystem writes remain confined to the worktree). Prefer running offline/unit package tests "
             "first and avoid probing `docker info` if Docker is unavailable. The Orchestrator will still "
-            "run full independent host verification after you finish."
+            "run full independent host verification after you finish. Once all required edits and "
+            "sandbox-safe checks pass, return `status: \"ready_for_verify\"` or `status: \"completed\"`."
         )
     else:
         sandbox_rule = (
-            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "7. You are running inside a `workspace-write` sandbox with a pre-configured writable "
             "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
             "polluting the repo). Prefer running offline/unit package tests that do not require "
             "outbound network access, loopback port binding (e.g. 127.0.0.1), a live database, or the "
@@ -206,8 +207,14 @@ def build_codex_prompt(
         "1. Implement the task strictly according to the immutable PLAN below.",
         "2. Do NOT weaken, delete, or skip tests, linters, or type checks to make checks pass.",
         "3. Do NOT run git commit, git push, git merge, or destructive git clean commands.",
-        "4. Run relevant sandbox-safe checks before finishing, and report accurate results.",
-        "5. Return your final response strictly conforming to the provided JSON output schema.",
+        "4. Complete the FULL implementation across all Target Files in this turn before finishing. "
+        "Do NOT stop early, do NOT exit with zero file edits, and do NOT return `status: \"partial\"` "
+        "merely because the plan spans multiple layers or files — the Orchestrator's post-execution "
+        "invariant guard automatically rejects `partial` and zero-diff exits. Only return "
+        "`status: \"blocked\"` if a concrete external prerequisite makes implementation genuinely "
+        "impossible, and state that exact blocker.",
+        "5. Run relevant sandbox-safe checks before finishing, and report accurate results.",
+        "6. Return your final response strictly conforming to the provided JSON output schema.",
         sandbox_rule,
         "",
         "=== IMMUTABLE PLAN CONTRACT ===",

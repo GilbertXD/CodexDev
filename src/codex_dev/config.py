@@ -75,6 +75,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "effort_escalation_order": ["low", "medium", "high", "xhigh"],
         "max_auto_effort": "xhigh",
+        "auto_promote_by_plan_scope": True,
+        "plan_scope_high_target_files": 8,
+        "plan_scope_high_criteria": 6,
     },
     "reviewer": {
         "mode": "inherit_session",

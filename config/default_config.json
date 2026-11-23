@@ -63,7 +63,10 @@
       "high": "high"
     },
     "effort_escalation_order": ["low", "medium", "high", "xhigh"],
-    "max_auto_effort": "xhigh"
+    "max_auto_effort": "xhigh",
+    "auto_promote_by_plan_scope": true,
+    "plan_scope_high_target_files": 8,
+    "plan_scope_high_criteria": 6
   },
   "reviewer": {
     "mode": "inherit_session",

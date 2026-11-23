@@ -12,6 +12,7 @@ class InvalidModelError(ValueError):
 
 
 VALID_COMPLEXITIES = {"low", "medium", "high"}
+COMPLEXITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 VALID_MODES = {"auto", "manual"}
 ALLOWED_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 DISALLOWED_EFFORTS: frozenset[str] = frozenset({"max", "ultra"})
@@ -485,6 +486,173 @@ def select_model_for_round(
         effort_escalated_from=effort_escalated_from,
         effort_locked=effort_locked,
     )
+
+
+def _classify_target_layer(path: str) -> str:
+    p = path.strip().lower()
+    if "migration" in p or p.endswith(".sql") or p.endswith("schema.prisma"):
+        return "migration"
+    if (
+        p.startswith("tests/")
+        or "/tests/" in p
+        or "/test/" in p
+        or "/__tests__/" in p
+        or p.endswith("_test.go")
+        or p.endswith("_test.py")
+        or p.endswith("_test.rs")
+        or ".test." in p
+        or ".spec." in p
+        or p.split("/")[-1].startswith("test_")
+    ):
+        return "tests"
+    if p.endswith(".md") or p.startswith("docs/") or "/docs/" in p:
+        return "docs"
+    base = p.split("/")[-1]
+    if (
+        base.startswith("dockerfile")
+        or base.startswith("docker-compose")
+        or base.startswith(".env")
+        or base in {"makefile", "pyproject.toml", "package.json", "go.mod", "cargo.toml"}
+        or p.startswith("configs/")
+        or "/configs/" in p
+        or base.endswith((".yaml", ".yml", ".toml"))
+    ):
+        return "config_deploy"
+    return "source"
+
+
+def assess_plan_complexity(
+    contract: dict[str, Any] | None,
+    *,
+    high_target_files: int = 8,
+    high_criteria: int = 6,
+) -> tuple[str, list[str]]:
+    """Deterministically estimate minimum complexity tier from a locked PLAN.md contract."""
+    if not isinstance(contract, dict):
+        return ("low", [])
+    target_files = [str(f).strip() for f in (contract.get("target_files") or []) if str(f).strip()]
+    criteria = [str(c).strip() for c in (contract.get("acceptance_criteria") or []) if str(c).strip()]
+    layers = {_classify_target_layer(f) for f in target_files}
+
+    reasons: list[str] = []
+    if len(target_files) >= max(1, int(high_target_files)):
+        reasons.append(f"{len(target_files)} target files (>= {int(high_target_files)})")
+    if len(criteria) >= max(1, int(high_criteria)) and len(target_files) >= 4:
+        reasons.append(f"{len(criteria)} acceptance criteria across {len(target_files)} target files")
+    if {"migration", "source", "tests"}.issubset(layers):
+        reasons.append("cross-layer scope spanning database migrations, source code, and tests")
+    if reasons:
+        return ("high", reasons)
+
+    med_reasons: list[str] = []
+    if len(target_files) >= 4:
+        med_reasons.append(f"{len(target_files)} target files")
+    if {"source", "tests"}.issubset(layers) and len(criteria) >= 3:
+        med_reasons.append(f"source + tests with {len(criteria)} acceptance criteria")
+    if med_reasons:
+        return ("medium", med_reasons)
+
+    return ("low", [])
+
+
+def promote_policy_for_plan_scope(
+    task_model_policy: dict[str, Any],
+    config: dict[str, Any],
+    contract: dict[str, Any] | None,
+    *,
+    cached_models: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Promote auto-routed task complexity/model/effort upward when locked PLAN.md scope warrants it.
+
+    Strictly preserves manual mode, locked models, locked efforts, and authorized_models validation.
+    Never downgrades complexity.
+    """
+    policy_cfg = config.get("model_policy") or {}
+    if not bool(policy_cfg.get("auto_promote_by_plan_scope", True)):
+        return {"promoted": False}
+    if str(task_model_policy.get("mode") or "auto") != "auto":
+        return {"promoted": False}
+    if bool(task_model_policy.get("locked", False)):
+        return {"promoted": False}
+
+    cur_comp = str(task_model_policy.get("complexity") or "medium")
+    if cur_comp not in COMPLEXITY_RANK:
+        cur_comp = "medium"
+
+    high_tf = int(policy_cfg.get("plan_scope_high_target_files", 8))
+    high_ac = int(policy_cfg.get("plan_scope_high_criteria", 6))
+    recommended, reasons = assess_plan_complexity(
+        contract,
+        high_target_files=high_tf,
+        high_criteria=high_ac,
+    )
+    if COMPLEXITY_RANK.get(recommended, 0) <= COMPLEXITY_RANK[cur_comp]:
+        return {"promoted": False}
+
+    routing = policy_cfg.get("complexity_routing") or {}
+    authorized = get_authorized_models(config)
+    old_model = str(task_model_policy.get("current_model") or task_model_policy.get("initial_model") or "")
+    cand_model = routing.get(recommended) or old_model or policy_cfg.get("default_model") or (authorized[0] if authorized else None)
+    new_model = validate_model_id(cand_model, config)
+
+    old_effort = str(
+        task_model_policy.get("current_reasoning_effort")
+        or task_model_policy.get("reasoning_effort")
+        or "medium"
+    )
+    effort_locked = bool(task_model_policy.get("effort_locked", False))
+    max_auto_effort = _normalize_max_auto_effort(task_model_policy.get("max_auto_effort", "xhigh"))
+    effort_map = task_model_policy.get("effort_by_complexity") or DEFAULT_EFFORT_BY_COMPLEXITY
+
+    if effort_locked:
+        new_effort = old_effort
+    else:
+        cand_effort = str(effort_map.get(recommended) or old_effort)
+        validated_effort, _ = validate_reasoning_effort(
+            cand_effort,
+            model_id=new_model,
+            cached_models=cached_models,
+            max_effort=max_auto_effort,
+            clamp=True,
+        )
+        # Never downgrade effort when promoting scope
+        new_effort = (
+            validated_effort
+            if _effort_rank(validated_effort) >= _effort_rank(old_effort)
+            else old_effort
+        )
+
+    reason_text = (
+        f"Auto-promoted complexity from '{cur_comp}' to '{recommended}' based on PLAN.md scope "
+        f"({'; '.join(reasons)}): model '{old_model}' -> '{new_model}', effort '{old_effort}' -> '{new_effort}'."
+    )
+
+    task_model_policy["complexity"] = recommended
+    task_model_policy["scope_promoted_from"] = cur_comp
+    task_model_policy["scope_promotion_reasons"] = reasons
+    task_model_policy["initial_model"] = new_model
+    task_model_policy["current_model"] = new_model
+    task_model_policy["initial_reasoning_effort"] = new_effort
+    task_model_policy["current_reasoning_effort"] = new_effort
+    task_model_policy["reasoning_effort"] = new_effort
+    task_model_policy["initial_reason"] = reason_text
+
+    esc_order = list(task_model_policy.get("escalation_order") or [])
+    if new_model not in esc_order and new_model in authorized:
+        esc_order.insert(0, new_model)
+        task_model_policy["escalation_order"] = esc_order
+
+    return {
+        "promoted": True,
+        "from_complexity": cur_comp,
+        "to_complexity": recommended,
+        "from_model": old_model,
+        "to_model": new_model,
+        "from_effort": old_effort,
+        "to_effort": new_effort,
+        "reasons": reasons,
+        "reason": reason_text,
+    }
 
 
 def make_model_history_entry(

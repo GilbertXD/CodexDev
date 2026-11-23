@@ -1452,6 +1452,98 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertTrue(exec3["ok"])
         self.assertEqual(exec3["state"]["status"], STATE_VERIFYING)
 
+    def test_29_plan_scope_auto_promotion_and_hardened_builder_prompt(self) -> None:
+        from codex_dev.models import assess_plan_complexity
+
+        repo = _create_python_repo(self.tmp_path / "scope_promo_repo")
+        large_plan = """# Full-stack vertical slice
+
+## Goal
+Add standalone documents with migration, API, and integration tests.
+
+## Target Files
+- `migrations/00005_create_documents.sql`
+- `internal/config/config.go`
+- `internal/domain/document.go`
+- `internal/repository/document.go`
+- `internal/service/document.go`
+- `internal/service/document_test.go`
+- `internal/handler/document.go`
+- `internal/handler/document_test.go`
+- `internal/integration/document_integration_test.go`
+
+## Acceptance Criteria
+1. CRUD works for standalone documents.
+2. Optimistic concurrency rejects stale versions.
+
+## Verification Commands
+- `python3 -m unittest discover -v`
+"""
+        # 1) assess_plan_complexity detects >= 8 target files and cross-layer migration+source+tests
+        comp, reasons = assess_plan_complexity(parse_plan_markdown(large_plan))
+        self.assertEqual(comp, "high")
+        self.assertGreaterEqual(len(reasons), 2)
+
+        # 2) Auto-mode medium task gets promoted to high (gpt-6-luna -> gpt-6.2-sol, effort medium -> high) on save_plan
+        rec_file = self.tmp_path / "scope_promo_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Cross-layer feature", repo_path=repo, complexity="medium")["task"]["task_id"]
+        plan_res = self.orch.save_plan(tid, large_plan)
+        self.assertTrue(plan_res.get("plan_scope_promotion", {}).get("promoted"))
+        mp = plan_res["state"]["model_policy"]
+        self.assertEqual(mp["complexity"], "high")
+        self.assertEqual(mp["scope_promoted_from"], "medium")
+        self.assertEqual(mp["current_model"], "gpt-6.2-sol")
+        self.assertEqual(mp["current_reasoning_effort"], "high")
+        ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
+        self.assertIn("plan_scope_promoted", ev_types)
+
+        exec_res = self.orch.execute_round(tid)
+        self.assertTrue(exec_res["ok"])
+        rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
+        self.assertEqual(rec["model"], "gpt-6.2-sol")
+        # Hardened Builder prompt explicitly prohibits early partial / zero-diff exits
+        self.assertIn("Complete the FULL implementation across all Target Files", rec["prompt"])
+        self.assertIn("post-execution invariant guard", rec["prompt"])
+
+        # 3) Locked manual model is NEVER overridden by plan-scope promotion
+        tid_locked = self.orch.init_task(
+            name="Locked manual",
+            repo_path=repo,
+            model_mode="manual",
+            model="gpt-6-luna",
+            lock_model=True,
+            complexity="low",
+        )["task"]["task_id"]
+        locked_res = self.orch.save_plan(tid_locked, large_plan)
+        self.assertNotIn("plan_scope_promotion", locked_res)
+        self.assertEqual(locked_res["state"]["model_policy"]["current_model"], "gpt-6-luna")
+
+        # 4) Locked effort stays locked while auto model still promotes
+        tid_eff_lock = self.orch.init_task(
+            name="Auto model locked effort",
+            repo_path=repo,
+            complexity="medium",
+            reasoning_effort="low",
+            lock_effort=True,
+        )["task"]["task_id"]
+        eff_res = self.orch.save_plan(tid_eff_lock, large_plan)
+        self.assertEqual(eff_res["state"]["model_policy"]["current_model"], "gpt-6.2-sol")
+        self.assertEqual(eff_res["state"]["model_policy"]["current_reasoning_effort"], "low")
+
+        # 5) Network-enabled sandbox prompt also includes completion/ready_for_verify instruction
+        net_prompt = build_codex_prompt(
+            task_name="Net sandbox",
+            plan_text=PLAN_PY,
+            feedback_text=None,
+            repair_round=0,
+            worktree_path=self.tmp_path,
+            builder_network_access=True,
+        )
+        self.assertIn("Complete the FULL implementation across all Target Files", net_prompt)
+        self.assertIn("ready_for_verify", net_prompt)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
