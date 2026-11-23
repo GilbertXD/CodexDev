@@ -53,7 +53,7 @@ You are the **Architect** and **Reviewer**. **Codex CLI** is the **Builder**. Th
 ### Step 2 — Author Immutable Plan Contract (`PLANNED`)
 Write a clear, testable `PLAN.md` containing:
 - `## Goal`
-- `## Target Files` (explicit expected files/directories in backticks)
+- `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, or environment variables, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, and config templates up front to avoid avoidable `unexpected_files` audit warnings)
 - `## Implementation Plan`
 - `## Acceptance Criteria` (concrete, verifiable checklist items)
 - `## Verification Commands` (project-specific test, build, lint, typecheck commands in backticks)
@@ -88,6 +88,7 @@ When state is `REVIEWING`:
 3. Verify semantically against the immutable `PLAN.md`:
    - Every acceptance criterion is genuinely satisfied.
    - No tests, linters, type checks, or configs were weakened or bypassed.
+   - Check `verification_summary.skipped_tests_total` and `skipped_tests`: if tests were skipped (e.g., DB integration tests waiting on `TEST_DATABASE_URL`), verify whether it is an environment prerequisite (which can be configured via `repo_overrides.<repo_path>.verify.env` in `~/.codex-dev/config.json` or `<repo>/.codex-dev.local.json`) and report skipped coverage explicitly to the user.
    - No unintended or out-of-scope edits exist.
    - Edge cases, error handling, readability, and security are solid.
 4. Record the verdict:

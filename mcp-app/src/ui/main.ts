@@ -21,6 +21,7 @@ interface VerificationCheck {
   passed: boolean;
   exit_code: number;
   duration_sec: number;
+  skipped_count?: number;
 }
 
 interface DiffFileItem {
@@ -273,6 +274,16 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
   const verTotal = Number(verSummary?.commands_total ?? checks.length ?? 0);
   const verPassed = Number(verSummary?.commands_passed ?? checks.filter((c) => c.passed).length ?? 0);
   const verFailed = Number(verSummary?.commands_failed ?? checks.filter((c) => !c.passed).length ?? 0);
+  const verSkipped = isVerifyingNow
+    ? 0
+    : Number(verSummary?.skipped_tests_total ?? verFull?.skipped_tests_total ?? 0);
+  const verSkippedNames: string[] = isVerifyingNow
+    ? []
+    : Array.isArray(verSummary?.skipped_tests)
+      ? (verSummary?.skipped_tests as string[])
+      : Array.isArray(verFull?.skipped_tests)
+        ? (verFull?.skipped_tests as string[])
+        : [];
   const verOverall = isVerifyingNow ? "RUN" : verSummary ? (verSummary.passed ? "PASS" : "FAIL") : "WAIT";
 
   const diff = (state.diff_stats || {}) as Record<string, unknown>;
@@ -348,7 +359,9 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
                     <div class="check-cmd" title="${esc(c.command)}">${esc(c.command)}</div>
                   </div>
                 </div>
-                <div class="check-right">exit ${esc(c.exit_code)} · ${esc(c.duration_sec)}s</div>
+                <div class="check-right">exit ${esc(c.exit_code)} · ${esc(c.duration_sec)}s${
+                  c.skipped_count && c.skipped_count > 0 ? ` · ${esc(c.skipped_count)} skip` : ""
+                }</div>
               </div>
             `,
             )
@@ -356,13 +369,17 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
         </div>`
       : `<p class="muted-placeholder">${isVerifyingNow ? "Running independent verification…" : "No verification commands executed yet."}</p>`;
 
-  const auditChips: string[] = [];
+  const auditChips: Array<{ text: string; warn?: boolean; title?: string }> = [];
   if (verSummary) {
-    auditChips.push(`CONTRACT ${verSummary.contract_valid ? "VERIFIED" : "TAMPERED"}`);
+    auditChips.push({ text: `CONTRACT ${verSummary.contract_valid ? "VERIFIED" : "TAMPERED"}` });
     const blockingCount = Number(verSummary.blocking_audit_issues ?? 0);
     const warnCount = Number(verSummary.warnings ?? 0);
-    auditChips.push(`AUDIT ${blockingCount === 0 ? "CLEAN" : `${blockingCount} BLOCKING`}`);
-    if (warnCount > 0) auditChips.push(`${warnCount} WARN`);
+    auditChips.push({ text: `AUDIT ${blockingCount === 0 ? "CLEAN" : `${blockingCount} BLOCKING`}` });
+    if (verSkipped > 0) {
+      const tip = verSkippedNames.length > 0 ? `Skipped: ${verSkippedNames.slice(0, 8).join(", ")}` : `${verSkipped} test(s) skipped`;
+      auditChips.push({ text: `${verSkipped} SKIPPED`, warn: true, title: tip });
+    }
+    if (warnCount > 0) auditChips.push({ text: `${warnCount} WARN`, warn: true });
   }
 
   const reviewHtml = latestReview
@@ -495,7 +512,13 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
       <div class="telemetry-cell">
         <div class="telemetry-label">Tests</div>
         <div class="telemetry-value">${esc(verOverall)}</div>
-        <div class="telemetry-sub">${isVerifyingNow ? "Running checks…" : verTotal > 0 ? `${verPassed} pass · ${verFailed} fail` : "Not run"}</div>
+        <div class="telemetry-sub">${
+          isVerifyingNow
+            ? "Running checks…"
+            : verTotal > 0
+              ? `${verPassed} pass · ${verFailed} fail${verSkipped > 0 ? ` · ${verSkipped} skip` : ""}`
+              : "Not run"
+        }</div>
       </div>
       <div class="telemetry-cell">
         <div class="telemetry-label">Git Diff</div>
@@ -517,7 +540,12 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
       ${checksHtml}
       ${
         auditChips.length > 0
-          ? `<div class="audit-strip">${auditChips.map((c) => `<span class="audit-chip">${esc(c)}</span>`).join("")}</div>`
+          ? `<div class="audit-strip">${auditChips
+              .map(
+                (c) =>
+                  `<span class="audit-chip${c.warn ? " is-warn" : ""}"${c.title ? ` title="${esc(c.title)}"` : ""}>${esc(c.text)}</span>`,
+              )
+              .join("")}</div>`
           : ""
       }
     </section>

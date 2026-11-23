@@ -68,10 +68,22 @@ writeFileSync(
       commands_total: 1,
       commands_passed: 1,
       commands_failed: 0,
+      skipped_tests_total: 2,
+      skipped_tests: ["TestProjectLifecycle", "TestRepositoryLifecycle"],
       contract_valid: true,
       blocking_audit_issues: 0,
-      warnings: 0,
-      checks: [{ name: "python:unittest", kind: "test", command: "python3 -m unittest", passed: true, exit_code: 0, duration_sec: 0.24 }],
+      warnings: 1,
+      checks: [
+        {
+          name: "python:unittest",
+          kind: "test",
+          command: "python3 -m unittest",
+          passed: true,
+          exit_code: 0,
+          duration_sec: 0.24,
+          skipped_count: 2,
+        },
+      ],
     },
     latest_review: {
       round: 0,
@@ -182,6 +194,9 @@ try {
   assert.equal(sc?.state?.model_policy?.current_model, "gpt-6-luna");
   assert.equal(sc?.state?.diff_stats?.files_changed_count, 2);
   assert.equal(sc?.state?.token_usage?.total_tokens, 2550);
+  assert.equal(sc?.state?.verification_summary?.skipped_tests_total, 2);
+  const summaryText = openCall.result?.content?.[0]?.text || "";
+  assert.ok(summaryText.includes("2 skipped"), `Expected plain-text summary to mention skipped tests, got: ${summaryText}`);
 
   const pollCall = await rpc(5, "tools/call", { name: "get_monitor_snapshot", arguments: { task_id: taskId } });
   assert.equal(pollCall.result?.structuredContent?.events?.length, 1);

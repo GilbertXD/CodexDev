@@ -43,6 +43,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commands": [],
         "env": {},
     },
+    "repo_overrides": {},
     "model_policy": {
         "mode": "auto",
         "locked": False,
@@ -159,22 +160,51 @@ def read_local_codex_hints(codex_home: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _resolve_repo_override(repo_overrides: Any, repo_path: Path) -> dict[str, Any] | None:
+    """Return matching per-repository override dict from global config.repo_overrides."""
+    if not isinstance(repo_overrides, dict):
+        return None
+    resolved_target = Path(repo_path).expanduser().resolve()
+    for raw_key, value in repo_overrides.items():
+        if not isinstance(raw_key, str) or not raw_key.strip() or not isinstance(value, dict):
+            continue
+        try:
+            candidate = Path(raw_key.strip()).expanduser().resolve()
+        except OSError:
+            continue
+        if candidate == resolved_target:
+            return value
+    return None
+
+
 def load_config(repo_path: Path | None = None, home_dir: Path | None = None) -> dict[str, Any]:
-    """Load merged global + repository configuration."""
+    """Load merged global + repository configuration.
+
+    Precedence (lowest to highest):
+      1. DEFAULT_CONFIG
+      2. ~/.codex-dev/config.json (global defaults)
+      3. <repo>/.codex-dev.json (shared repository config)
+      4. ~/.codex-dev/config.json -> repo_overrides[<resolved_repo_path>] (non-intrusive local per-repo overrides)
+      5. <repo>/.codex-dev.local.json (machine-local repository overrides)
+      6. CODEX_DEV_CODEX_BIN environment variable
+    """
     home = home_dir or get_codex_dev_home()
     cfg = copy.deepcopy(DEFAULT_CONFIG)
+    global_repo_overrides: Any = None
 
     global_path = home / "config.json"
     if global_path.is_file():
         try:
             global_data = json.loads(global_path.read_text(encoding="utf-8"))
             if isinstance(global_data, dict):
+                global_repo_overrides = global_data.get("repo_overrides")
                 cfg = _deep_merge(cfg, global_data)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Invalid global config at {global_path}: {exc}") from exc
 
     if repo_path is not None:
-        repo_cfg_path = Path(repo_path) / ".codex-dev.json"
+        repo_root = Path(repo_path)
+        repo_cfg_path = repo_root / ".codex-dev.json"
         if repo_cfg_path.is_file():
             try:
                 repo_data = json.loads(repo_cfg_path.read_text(encoding="utf-8"))
@@ -182,6 +212,20 @@ def load_config(repo_path: Path | None = None, home_dir: Path | None = None) -> 
                     cfg = _deep_merge(cfg, repo_data)
             except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError(f"Invalid repository config at {repo_cfg_path}: {exc}") from exc
+
+        repo_override = _resolve_repo_override(global_repo_overrides, repo_root)
+        if repo_override:
+            override_clean = {k: v for k, v in repo_override.items() if k != "repo_overrides"}
+            cfg = _deep_merge(cfg, override_clean)
+
+        repo_local_cfg_path = repo_root / ".codex-dev.local.json"
+        if repo_local_cfg_path.is_file():
+            try:
+                local_data = json.loads(repo_local_cfg_path.read_text(encoding="utf-8"))
+                if isinstance(local_data, dict):
+                    cfg = _deep_merge(cfg, local_data)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid local repository config at {repo_local_cfg_path}: {exc}") from exc
 
     # Environment override for codex binary (used by mock testing and custom installs)
     env_bin = os.environ.get("CODEX_DEV_CODEX_BIN")

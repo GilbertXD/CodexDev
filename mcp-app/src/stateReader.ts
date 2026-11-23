@@ -216,8 +216,10 @@ export function formatPlainTextSummary(snapshot: MonitorSnapshot): string {
   ];
 
   if (ver && typeof ver.commands_total === "number") {
+    const skipped = Number(ver.skipped_tests_total ?? 0);
+    const skipSuffix = skipped > 0 ? `, ${skipped} skipped` : "";
     lines.push(
-      `Verification: ${ver.passed ? "PASSED" : "FAILED"} (${ver.commands_passed}/${ver.commands_total} checks)`,
+      `Verification: ${ver.passed ? "PASSED" : "FAILED"} (${ver.commands_passed}/${ver.commands_total} checks${skipSuffix})`,
     );
   }
   if (tok && tok.available) {

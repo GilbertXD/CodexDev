@@ -709,6 +709,13 @@ body {
   background: var(--bg-subtle);
 }
 
+.audit-chip.is-warn {
+  border-style: dashed;
+  border-color: var(--fg);
+  color: var(--fg);
+  font-weight: 600;
+}
+
 /* Review Card */
 .review-box {
   padding: 10px;

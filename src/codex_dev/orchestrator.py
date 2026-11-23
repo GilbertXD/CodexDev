@@ -750,6 +750,8 @@ class Orchestrator:
             )
 
             state["diff_stats"] = report["diff_stats"]
+            skipped_total = int(report.get("skipped_tests_total", 0))
+            skipped_names = list(report.get("skipped_tests") or [])
             state["verification_summary"] = {
                 "verified_at": report["verified_at"],
                 "passed": report["passed"],
@@ -757,6 +759,8 @@ class Orchestrator:
                 "commands_total": report["commands_total"],
                 "commands_passed": report["commands_passed"],
                 "commands_failed": report["commands_failed"],
+                "skipped_tests_total": skipped_total,
+                "skipped_tests": skipped_names,
                 "contract_valid": report["contract_integrity"]["valid"],
                 "blocking_audit_issues": len(report["diff_audit"]["blocking_issues"]),
                 "warnings": len(report["diff_audit"]["warnings"]),
@@ -768,6 +772,7 @@ class Orchestrator:
                         "passed": c["passed"],
                         "exit_code": c["exit_code"],
                         "duration_sec": c["duration_sec"],
+                        "skipped_count": int(c.get("skipped_count", 0)),
                     }
                     for c in report["checks"]
                 ],
@@ -777,7 +782,9 @@ class Orchestrator:
             self.store.append_execution_log(
                 tid,
                 f"Independent Verification ({'PASSED' if report['passed'] else 'FAILED'})",
-                f"- Source: `{report['command_source']}` | Passed: `{report['commands_passed']}/{report['commands_total']}`\n"
+                f"- Source: `{report['command_source']}` | Passed: `{report['commands_passed']}/{report['commands_total']}`"
+                + (f" | Skipped tests: `{skipped_total}`" if skipped_total > 0 else "")
+                + "\n"
                 f"- Contract integrity: `{report['contract_integrity']['valid']}`\n"
                 f"- Audit blocking issues: `{len(report['diff_audit']['blocking_issues'])}` | Warnings: `{len(report['diff_audit']['warnings'])}`\n"
                 f"- Changed files: `{report['diff_stats']['files_changed_count']}` "
@@ -785,18 +792,20 @@ class Orchestrator:
             )
 
             if report["passed"]:
+                skip_note = f", {skipped_total} test(s) skipped" if skipped_total > 0 else ""
                 self.store.transition(
                     tid,
                     state,
                     STATE_REVIEWING,
                     event_type="verification_passed",
                     message=(
-                        f"Independent verification passed ({report['commands_passed']}/{report['commands_total']} checks); "
+                        f"Independent verification passed ({report['commands_passed']}/{report['commands_total']} checks{skip_note}); "
                         "handing off to Antigravity Reviewer."
                     ),
                     details={
                         "commands_passed": report["commands_passed"],
                         "commands_total": report["commands_total"],
+                        "skipped_tests_total": skipped_total,
                     },
                 )
                 return {"ok": True, "next_action": "review_required", "task_id": tid, "report": report, "state": state}

@@ -41,6 +41,69 @@ WEAKENING_ADDITION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 ASSERTION_LINE_RE = re.compile(r"\b(assert|expect|assertEqual|assertTrue|assertFalse|assertRaises|t\.Error|t\.Fatal)\b")
 
+_GO_SKIP_RE = re.compile(r"^\s*---\s+SKIP:\s+(\S+)", re.MULTILINE)
+_PY_UNITTEST_SKIP_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+(?:\s*\([^)]+\))?)\s+\.\.\.\s+skipped\b", re.MULTILINE)
+_PY_UNITTEST_SUMMARY_RE = re.compile(r"^(?:OK|FAILED)\s+\([^)]*\bskipped=(\d+)\b", re.MULTILINE)
+_PYTEST_SKIP_LINE_RE = re.compile(r"^\s*([^\s]+::[^\s]+)\s+SKIPPED\b", re.MULTILINE)
+_PYTEST_SUMMARY_RE = re.compile(r"(?:^=+[^\n]*?\b(\d+)\s+skipped\b[^\n]*?=+\s*$)|(?:^\s*(?:\d+\s+\w+,\s*)*(\d+)\s+skipped\b[^\n]*\bin\s+[\d.]+s)", re.MULTILINE)
+_RUST_IGNORED_LINE_RE = re.compile(r"^\s*test\s+(\S+)\s+\.\.\.\s+ignored\s*$", re.MULTILINE)
+_RUST_SUMMARY_RE = re.compile(r"^test result:\s+\w+\.\s+\d+\s+passed;\s+\d+\s+failed;\s+(\d+)\s+ignored;", re.MULTILINE)
+_NODE_TEST_SKIP_SUMMARY_RE = re.compile(r"^#\s+skipped\s+(\d+)\s*$", re.MULTILINE)
+_JS_TESTS_SUMMARY_RE = re.compile(r"^\s*Tests:\s+[^\n]*?\b(\d+)\s+skipped\b", re.MULTILINE)
+
+
+def detect_skipped_tests(stdout: str, stderr: str = "") -> dict[str, Any]:
+    """Parse test runner output across Go/Python/Node/Jest/Vitest/Rust for skipped tests.
+
+    Returns {"skipped_count": int, "skipped_tests": list[str]} where skipped_tests
+    holds up to 25 deduplicated sample test names.
+    """
+    combined = "\n".join(part for part in (stdout or "", stderr or "") if part)
+    if not combined.strip():
+        return {"skipped_count": 0, "skipped_tests": []}
+
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _add_name(raw: str) -> None:
+        cleaned = raw.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            names.append(cleaned)
+
+    go_matches = _GO_SKIP_RE.findall(combined)
+    for m in go_matches:
+        _add_name(m)
+
+    py_u_lines = _PY_UNITTEST_SKIP_LINE_RE.findall(combined)
+    for m in py_u_lines:
+        _add_name(m)
+    py_u_summary = sum(int(m) for m in _PY_UNITTEST_SUMMARY_RE.findall(combined))
+
+    pytest_lines = _PYTEST_SKIP_LINE_RE.findall(combined)
+    for m in pytest_lines:
+        _add_name(m)
+    pytest_summary = sum(int(a or b) for a, b in _PYTEST_SUMMARY_RE.findall(combined))
+
+    rust_lines = _RUST_IGNORED_LINE_RE.findall(combined)
+    for m in rust_lines:
+        _add_name(m)
+    rust_summary = sum(int(m) for m in _RUST_SUMMARY_RE.findall(combined))
+
+    node_summary = sum(int(m) for m in _NODE_TEST_SKIP_SUMMARY_RE.findall(combined))
+    js_summary = sum(int(m) for m in _JS_TESTS_SUMMARY_RE.findall(combined))
+
+    total = (
+        len(go_matches)
+        + max(len(py_u_lines), py_u_summary)
+        + max(len(pytest_lines), pytest_summary)
+        + max(len(rust_lines), rust_summary)
+        + node_summary
+        + js_summary
+    )
+    total = max(total, len(names))
+    return {"skipped_count": total, "skipped_tests": names[:25]}
+
 
 def is_test_file(path: str) -> bool:
     return any(p.search(path) for p in TEST_FILE_PATTERNS)
@@ -475,6 +538,9 @@ def run_independent_verification(
     checks: list[dict[str, Any]] = []
     passed_count = 0
     failed_count = 0
+    skipped_tests_total = 0
+    all_skipped_tests: list[str] = []
+    seen_skipped_tests: set[str] = set()
     verify_env = build_stage_env(config, "verify")
 
     for item in commands:
@@ -483,6 +549,8 @@ def run_independent_verification(
         kind = item["kind"]
         t0 = time.monotonic()
         timed_out = False
+        full_stdout = ""
+        full_stderr = ""
         try:
             proc = subprocess.run(
                 cmd_str,
@@ -494,12 +562,15 @@ def run_independent_verification(
                 env=verify_env,
             )
             exit_code = int(proc.returncode)
-            stdout_tail = proc.stdout[-4000:] if proc.stdout else ""
-            stderr_tail = proc.stderr[-4000:] if proc.stderr else ""
+            full_stdout = proc.stdout or ""
+            full_stderr = proc.stderr or ""
+            stdout_tail = full_stdout[-4000:] if full_stdout else ""
+            stderr_tail = full_stderr[-4000:] if full_stderr else ""
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             exit_code = -1
-            stdout_tail = (exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""))[-2000:]
+            full_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stdout_tail = full_stdout[-2000:]
             stderr_tail = f"Verification command timed out after {timeout_sec}s"
 
         duration = round(time.monotonic() - t0, 2)
@@ -508,6 +579,13 @@ def run_independent_verification(
             passed_count += 1
         else:
             failed_count += 1
+
+        skip_info = detect_skipped_tests(full_stdout, full_stderr)
+        skipped_tests_total += int(skip_info["skipped_count"])
+        for tname in skip_info["skipped_tests"]:
+            if tname not in seen_skipped_tests:
+                seen_skipped_tests.add(tname)
+                all_skipped_tests.append(tname)
 
         checks.append(
             {
@@ -518,8 +596,26 @@ def run_independent_verification(
                 "exit_code": exit_code,
                 "timed_out": timed_out,
                 "duration_sec": duration,
+                "skipped_count": int(skip_info["skipped_count"]),
+                "skipped_tests": skip_info["skipped_tests"],
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
+            }
+        )
+
+    if skipped_tests_total > 0:
+        sample = ", ".join(all_skipped_tests[:5])
+        suffix = "..." if len(all_skipped_tests) > 5 else ""
+        detail = f" ({sample}{suffix})" if sample else ""
+        integrity_audit["warnings"].append(
+            {
+                "code": "skipped_tests",
+                "count": skipped_tests_total,
+                "tests": all_skipped_tests[:25],
+                "message": (
+                    f"{skipped_tests_total} test(s) were skipped during verification{detail}; "
+                    "verify required test environment variables or backing services are configured."
+                ),
             }
         )
 
@@ -546,6 +642,8 @@ def run_independent_verification(
         "commands_total": len(checks),
         "commands_passed": passed_count,
         "commands_failed": failed_count,
+        "skipped_tests_total": skipped_tests_total,
+        "skipped_tests": all_skipped_tests[:25],
         "checks": checks,
         "prepare": prepare_report,
         "contract_integrity": contract_check,

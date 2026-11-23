@@ -32,6 +32,7 @@
     "commands": [],
     "env": {}
   },
+  "repo_overrides": {},
   "model_policy": {
     "mode": "auto",
     "locked": false,

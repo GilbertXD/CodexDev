@@ -57,7 +57,11 @@ Codex CLI runs inside `-s workspace-write` (offline) with an automatic writable 
 
 When a task introduces new third-party dependencies (for example, modifying `go.mod`), the Orchestrator runs a non-sandbox **Prepare** step (`auto_go_mod_tidy: true` by default, or explicit `prepare.commands` / `## Prepare Commands` / `--prepare-cmd`) before independent verification. Prepare failures transition to `BLOCKED` (`dependency_prepare_failure`) without consuming a code-repair round.
 
-You can pass environment overrides (such as `GOPROXY`) to Verify and Prepare stages via `~/.codex-dev/config.json` or `<repo>/.codex-dev.json`:
+You can pass environment overrides (such as `GOPROXY` or `TEST_DATABASE_URL`) to Verify and Prepare stages via:
+1. Global `~/.codex-dev/config.json` (`verify.env` / `prepare.env`)
+2. Shared repository `<repo>/.codex-dev.json`
+3. Non-intrusive per-repository `repo_overrides` inside `~/.codex-dev/config.json` (keyed by repository path, keeping local secrets/DSNs out of the target Git repo)
+4. Machine-local `<repo>/.codex-dev.local.json` (highest file precedence)
 
 ```json
 {
@@ -73,9 +77,22 @@ You can pass environment overrides (such as `GOPROXY`) to Verify and Prepare sta
     "env": {
       "GOPROXY": "https://goproxy.cn,direct"
     }
+  },
+  "repo_overrides": {
+    "/path/to/your-repo": {
+      "verify": {
+        "env": {
+          "TEST_DATABASE_URL": "postgres://user:pass@localhost:5432/app?sslmode=disable"
+        }
+      }
+    }
   }
 }
 ```
+
+### Skipped-Test Visibility
+
+Independent verification parses test runner output across Go (`--- SKIP:`), Python (`unittest` / `pytest`), Rust (`ignored`), Node (`node --test`), and Jest/Vitest. Any skipped tests are recorded in `verification.json` (`skipped_tests_total`, `skipped_tests`), surfaced as a non-blocking `skipped_tests` audit warning, and highlighted in the **Codex Dev Monitor** side panel so silently skipped integration suites never go unnoticed.
 
 ## Usage in Antigravity Chat
 

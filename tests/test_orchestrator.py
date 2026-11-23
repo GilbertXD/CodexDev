@@ -16,11 +16,11 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from codex_dev.codex_runner import build_codex_prompt
-from codex_dev.config import DEFAULT_CONFIG, resolve_codex_timeouts
+from codex_dev.config import DEFAULT_CONFIG, load_config, resolve_codex_timeouts
 from codex_dev.contract import normalize_target_path, parse_plan_markdown
 from codex_dev.models import InvalidModelError
 from codex_dev.orchestrator import Orchestrator
-from codex_dev.verifier import detect_prepare_commands
+from codex_dev.verifier import detect_prepare_commands, detect_skipped_tests
 from codex_dev.state import (
     STATE_BLOCKED,
     STATE_COMPLETED,
@@ -718,6 +718,134 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertIsNone(mid["failure_category"])
         self.assertIsNone(mid["verification_summary"])
         self.assertFalse(mid["ver_file_exists"])
+
+    def test_17_repo_overrides_and_local_config_precedence(self) -> None:
+        repo_a = _create_python_repo(self.tmp_path / "a")
+        repo_b = _create_python_repo(self.tmp_path / "b")
+
+        # Configure global verify.env + repo_overrides scoped strictly to repo_a
+        global_cfg = json.loads((self.home_dir / "config.json").read_text(encoding="utf-8"))
+        global_cfg["verify"] = {"commands": [], "env": {"GLOBAL_VAR": "from-global", "SHARED_VAR": "global"}}
+        global_cfg["repo_overrides"] = {
+            str(repo_a): {
+                "verify": {
+                    "env": {
+                        "SHARED_VAR": "repo-override",
+                        "TEST_DATABASE_URL": "postgres://localhost:5432/repo_a",
+                    }
+                }
+            }
+        }
+        atomic_write_json(self.home_dir / "config.json", global_cfg)
+
+        # Shared repo config (lower precedence than repo_overrides)
+        atomic_write_json(
+            repo_a / ".codex-dev.json",
+            {"verify": {"env": {"SHARED_VAR": "repo-shared", "REPO_SHARED_ONLY": "yes"}}},
+        )
+
+        cfg_a = load_config(repo_path=repo_a, home_dir=self.home_dir)
+        self.assertEqual(cfg_a["verify"]["env"]["GLOBAL_VAR"], "from-global")
+        self.assertEqual(cfg_a["verify"]["env"]["REPO_SHARED_ONLY"], "yes")
+        self.assertEqual(cfg_a["verify"]["env"]["SHARED_VAR"], "repo-override")
+        self.assertEqual(cfg_a["verify"]["env"]["TEST_DATABASE_URL"], "postgres://localhost:5432/repo_a")
+
+        # repo_b must not inherit repo_a's repo_overrides
+        cfg_b = load_config(repo_path=repo_b, home_dir=self.home_dir)
+        self.assertEqual(cfg_b["verify"]["env"]["SHARED_VAR"], "global")
+        self.assertNotIn("TEST_DATABASE_URL", cfg_b["verify"]["env"])
+
+        # Machine-local .codex-dev.local.json overrides repo_overrides
+        atomic_write_json(
+            repo_a / ".codex-dev.local.json",
+            {"verify": {"env": {"SHARED_VAR": "repo-local", "LOCAL_ONLY": "1"}}},
+        )
+        cfg_a_local = load_config(repo_path=repo_a, home_dir=self.home_dir)
+        self.assertEqual(cfg_a_local["verify"]["env"]["SHARED_VAR"], "repo-local")
+        self.assertEqual(cfg_a_local["verify"]["env"]["LOCAL_ONLY"], "1")
+        self.assertEqual(cfg_a_local["verify"]["env"]["TEST_DATABASE_URL"], "postgres://localhost:5432/repo_a")
+
+        # End-to-end verification subprocess receives the merged repo-level env vars
+        (repo_a / ".codex-dev.json").unlink()
+        (repo_a / ".codex-dev.local.json").unlink()
+        tid = self.orch.init_task(name="Verify repo_overrides env", repo_path=repo_a)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.execute_round(tid)
+        ver_res = self.orch.verify_task(
+            tid,
+            verify_commands=[
+                "python3 -c \"import os, sys; sys.exit(0 if os.environ.get('TEST_DATABASE_URL') == 'postgres://localhost:5432/repo_a' else 1)\"",
+                "python3 -m unittest discover -v",
+            ],
+        )
+        self.assertTrue(ver_res["ok"])
+        self.assertEqual(ver_res["state"]["status"], STATE_REVIEWING)
+
+    def test_18_skipped_tests_detection_and_warning(self) -> None:
+        # Multi-stack parser checks
+        go_out = (
+            "=== RUN   TestProjectLifecycle\n"
+            "    project_integration_test.go:124: TEST_DATABASE_URL is unset\n"
+            "--- SKIP: TestProjectLifecycle (0.00s)\n"
+            "=== RUN   TestRepositoryLifecycle\n"
+            "--- SKIP: TestRepositoryLifecycle (0.00s)\n"
+            "PASS\n"
+        )
+        go_skips = detect_skipped_tests(go_out)
+        self.assertEqual(go_skips["skipped_count"], 2)
+        self.assertEqual(go_skips["skipped_tests"], ["TestProjectLifecycle", "TestRepositoryLifecycle"])
+
+        py_out = "test_db (test_app.TestDB) ... skipped 'no db'\n\nRan 3 tests in 0.01s\n\nOK (skipped=2)\n"
+        py_skips = detect_skipped_tests("", py_out)
+        self.assertEqual(py_skips["skipped_count"], 2)
+        self.assertIn("test_db (test_app.TestDB)", py_skips["skipped_tests"])
+
+        pytest_out = "tests/test_db.py::test_insert SKIPPED [ 50%]\n====== 1 passed, 1 skipped in 0.04s ======\n"
+        pytest_skips = detect_skipped_tests(pytest_out)
+        self.assertEqual(pytest_skips["skipped_count"], 1)
+        self.assertEqual(pytest_skips["skipped_tests"], ["tests/test_db.py::test_insert"])
+
+        rust_out = "test db::test_pg ... ignored\ntest result: ok. 4 passed; 0 failed; 1 ignored; 0 measured;\n"
+        rust_skips = detect_skipped_tests(rust_out)
+        self.assertEqual(rust_skips["skipped_count"], 1)
+        self.assertEqual(rust_skips["skipped_tests"], ["db::test_pg"])
+
+        node_out = "# tests 5\n# pass 3\n# skipped 2\n"
+        self.assertEqual(detect_skipped_tests(node_out)["skipped_count"], 2)
+
+        jest_out = "Tests:       3 skipped, 10 passed, 13 total\n"
+        self.assertEqual(detect_skipped_tests(jest_out)["skipped_count"], 3)
+
+        # Clean run has zero skips
+        self.assertEqual(detect_skipped_tests("PASS\nok example 0.01s\n")["skipped_count"], 0)
+
+        # End-to-end verification records skipped_tests_total + non-blocking audit warning
+        repo = _create_python_repo(self.tmp_path / "skip_repo")
+        tid = self.orch.init_task(name="Detect skipped tests", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.execute_round(tid)
+        emit_skip_cmd = (
+            "python3 -c \"print('--- SKIP: TestProjectLifecycle (0.00s)\\n--- SKIP: TestRepositoryLifecycle (0.00s)\\nPASS')\""
+        )
+        ver_res = self.orch.verify_task(
+            tid,
+            verify_commands=[emit_skip_cmd, "python3 -m unittest discover -v"],
+        )
+        self.assertTrue(ver_res["ok"])
+        self.assertEqual(ver_res["state"]["status"], STATE_REVIEWING)
+        report = ver_res["report"]
+        self.assertEqual(report["skipped_tests_total"], 2)
+        self.assertEqual(report["skipped_tests"], ["TestProjectLifecycle", "TestRepositoryLifecycle"])
+        self.assertEqual(report["checks"][0]["skipped_count"], 2)
+        self.assertEqual(report["checks"][1]["skipped_count"], 0)
+        warning_codes = [w["code"] for w in report["diff_audit"]["warnings"]]
+        self.assertIn("skipped_tests", warning_codes)
+
+        vs = ver_res["state"]["verification_summary"]
+        self.assertEqual(vs["skipped_tests_total"], 2)
+        self.assertEqual(vs["skipped_tests"], ["TestProjectLifecycle", "TestRepositoryLifecycle"])
+        self.assertEqual(vs["checks"][0]["skipped_count"], 2)
+        self.assertGreaterEqual(vs["warnings"], 1)
 
 
 if __name__ == "__main__":
