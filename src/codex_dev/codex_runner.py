@@ -60,11 +60,13 @@ def build_codex_prompt(
         (
             "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
             "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
-            "polluting the repo). If a command hits sandbox restrictions (such as outbound network "
-            "downloads for new dependencies, local port binding like 127.0.0.1, Docker daemon "
-            "permissions, or restricted host paths), record the limitation honestly in your result "
-            "and finish—do NOT repeatedly attempt workarounds. The Orchestrator will run non-sandbox "
-            "dependency preparation (e.g. `go mod tidy`) and independent verification after you finish."
+            "polluting the repo). Prefer running offline/unit package tests that do not require "
+            "outbound network access, loopback port binding (e.g. 127.0.0.1), a live database, or the "
+            "Docker daemon (do NOT probe `docker info` or retry blocked integration tests). If a "
+            "command hits sandbox restrictions, record the limitation honestly in your result and "
+            "finish—do NOT repeatedly attempt workarounds. The Orchestrator will run non-sandbox "
+            "dependency preparation (e.g. `go mod tidy`) and full independent verification after you "
+            "finish."
         ),
         "",
         "=== IMMUTABLE PLAN CONTRACT ===",
@@ -202,13 +204,17 @@ BENIGN_STDERR_MARKERS = (
 )
 
 
+def _is_benign_stderr_line(line: str) -> bool:
+    return any(marker in line for marker in BENIGN_STDERR_MARKERS)
+
+
 def _format_stderr_tail(chunks: list[str], *, max_lines: int = 40) -> str:
     """Collapse repetitive benign model-refresh timeout lines while preserving all real errors."""
     raw_lines = "".join(chunks).splitlines()
     kept: list[str] = []
     suppressed = 0
     for line in raw_lines:
-        if any(marker in line for marker in BENIGN_STDERR_MARKERS):
+        if _is_benign_stderr_line(line):
             suppressed += 1
             continue
         kept.append(line)
@@ -390,7 +396,7 @@ def run_codex_exec(
         if proc.stderr is None:
             return
         for line in proc.stderr:
-            if line.strip():
+            if line.strip() and not _is_benign_stderr_line(line):
                 _touch_activity()
             stderr_chunks.append(line)
             if len(stderr_chunks) > 200:

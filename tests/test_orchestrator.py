@@ -847,6 +847,32 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertEqual(vs["checks"][0]["skipped_count"], 2)
         self.assertGreaterEqual(vs["warnings"], 1)
 
+    def test_19_benign_stderr_does_not_reset_idle_timeout_and_sandbox_prompt(self) -> None:
+        from codex_dev.codex_runner import build_codex_prompt
+
+        prompt = build_codex_prompt(
+            task_name="Sandbox guidance check",
+            plan_text=PLAN_PY,
+            feedback_text=None,
+            repair_round=0,
+            worktree_path=self.tmp_path,
+        )
+        self.assertIn("Prefer running offline/unit package tests", prompt)
+        self.assertIn("docker info", prompt)
+
+        repo = _create_python_repo(self.tmp_path / "benign_hang")
+        os.environ["MOCK_CODEX_SCENARIO"] = "benign_stderr_hang"
+        tid = self.orch.init_task(name="Benign stderr idle timeout", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+
+        exec_res = self.orch.execute_round(tid, timeout_sec=10, idle_timeout_sec=1)
+        self.assertFalse(exec_res["ok"])
+        outcome = exec_res["outcome"]
+        self.assertTrue(outcome["timed_out"])
+        self.assertEqual(outcome["timeout_reason"], "idle")
+        self.assertLess(outcome["duration_sec"], 6.0)
+        self.assertIn("benign codex model-refresh timeout", outcome["stderr_tail"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -75,6 +75,16 @@ def main() -> int:
         time.sleep(30)
         return 0
 
+    if scenario == "benign_stderr_hang":
+        # Emits only benign model-refresh timeout lines to stderr while hung with no stdout events.
+        for _ in range(100):
+            sys.stderr.write(
+                "2026-11-23T03:11:30Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out\n"
+            )
+            sys.stderr.flush()
+            time.sleep(0.25)
+        return 0
+
     if scenario == "timeout_after_write":
         # Builder writes valid working code, emits event, then times out before exiting
         (wt / "calc.py").write_text(

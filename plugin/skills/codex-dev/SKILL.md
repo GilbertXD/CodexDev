@@ -53,7 +53,7 @@ You are the **Architect** and **Reviewer**. **Codex CLI** is the **Builder**. Th
 ### Step 2 — Author Immutable Plan Contract (`PLANNED`)
 Write a clear, testable `PLAN.md` containing:
 - `## Goal`
-- `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, or environment variables, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, and config templates up front to avoid avoidable `unexpected_files` audit warnings)
+- `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, environment variables, or database migrations/schema changes, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, config templates, and existing migration/rollback integration tests up front to avoid avoidable `unexpected_files` audit warnings or regression failures)
 - `## Implementation Plan`
 - `## Acceptance Criteria` (concrete, verifiable checklist items)
 - `## Verification Commands` (project-specific test, build, lint, typecheck commands in backticks)
