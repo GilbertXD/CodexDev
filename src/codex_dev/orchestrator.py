@@ -132,6 +132,79 @@ def _record_attempt_token_accounting(
     return tok
 
 
+def _check_post_execution_invariants(
+    structured_result: dict[str, Any] | None,
+    diff_stats: dict[str, Any] | None,
+    *,
+    allow_empty_diff: bool = False,
+) -> tuple[str | None, str | None]:
+    """Enforce deterministic post-execution invariants before entering host verification.
+
+    Prevents incomplete (`status == 'partial'`) or zero-change (`files_changed_count == 0`)
+    Builder exits from silently passing host verification against an unmodified baseline.
+    """
+    files_changed = int((diff_stats or {}).get("files_changed_count", 0))
+    status = str((structured_result or {}).get("status") or "").strip().lower()
+    summary = str((structured_result or {}).get("summary") or "").strip()
+
+    if status == "partial":
+        detail = f" ({summary[:240]})" if summary else ""
+        return (
+            "builder_partial",
+            f"Builder exited with status='partial' ({files_changed} file(s) changed){detail}; "
+            "complete implementation is required before verification.",
+        )
+
+    if not allow_empty_diff and files_changed == 0:
+        detail = f" (Builder summary: {summary[:240]})" if summary else ""
+        return (
+            "empty_diff",
+            f"Builder exited with zero worktree file changes relative to base commit{detail}; "
+            "refusing to run verification against an unchanged baseline.",
+        )
+
+    return (None, None)
+
+
+def _format_execution_invariant_feedback(
+    failure_category: str,
+    reason: str,
+    *,
+    structured_result: dict[str, Any] | None,
+    target_files: list[str] | None,
+    repair_round: int,
+) -> str:
+    lines = [
+        f"# Execution Invariant Feedback (Before Repair Round {repair_round})",
+        "",
+        f"The previous Builder round was rejected before verification (`{failure_category}`): {reason}",
+        "",
+        "## Required Action",
+        "- Implement the complete immutable PLAN.md contract inside the isolated worktree in this round.",
+        "- Do NOT stop early, do NOT return `status: \"partial\"`, and do NOT exit without editing the required files.",
+        "- Run the sandbox-safe Builder Checks after completing your edits, then return `status: \"ready_for_verify\"` or `status: \"completed\"`.",
+        "",
+    ]
+    unmet = [
+        item
+        for item in ((structured_result or {}).get("acceptance_criteria_status") or [])
+        if isinstance(item, dict) and item.get("met") is False
+    ]
+    if unmet:
+        lines.append("## Unmet Acceptance Criteria From Previous Attempt")
+        for item in unmet[:15]:
+            crit = str(item.get("criterion") or "").strip()
+            ev = str(item.get("evidence") or "").strip()
+            if crit:
+                lines.append(f"- {crit}" + (f" — {ev}" if ev else ""))
+        lines.append("")
+    if target_files:
+        lines.append("## Declared Target Files")
+        lines.extend(f"- `{tf}`" for tf in target_files[:30])
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
 def _format_verification_feedback(report: dict[str, Any], repair_round: int) -> str:
     lines = [
         f"# Verification Feedback (Before Repair Round {repair_round})",
@@ -659,6 +732,75 @@ class Orchestrator:
                 )
                 return {"ok": False, "task_id": tid, "outcome": outcome.__dict__, "state": state}
 
+            # Deterministic post-execution invariant guard: reject partial/no-op exits before verify
+            allow_empty_diff = bool(builder_cfg.get("allow_empty_diff", False))
+            inv_category, inv_reason = _check_post_execution_invariants(
+                outcome.structured_result,
+                state.get("diff_stats"),
+                allow_empty_diff=allow_empty_diff,
+            )
+            if inv_category is not None and inv_reason is not None:
+                max_repairs = int(state.get("max_repair_rounds", 3))
+                if repair_round < max_repairs:
+                    next_round = repair_round + 1
+                    state["repair_round"] = next_round
+                    fb_text = _format_execution_invariant_feedback(
+                        inv_category,
+                        inv_reason,
+                        structured_result=outcome.structured_result,
+                        target_files=list(contract_doc.get("target_files") or []),
+                        repair_round=next_round,
+                    )
+                    atomic_write_text(tdir / "FEEDBACK.md", fb_text)
+                    self.store.transition(
+                        tid,
+                        state,
+                        STATE_REVISING,
+                        event_type="execution_invariant_failed",
+                        message=(
+                            f"Post-execution invariant failed ({inv_category}): {inv_reason} "
+                            f"Prepared repair round {next_round}/{max_repairs}."
+                        ),
+                        failure_category=inv_category,
+                        last_error=inv_reason,
+                        details={
+                            "invariant": inv_category,
+                            "files_changed": state["diff_stats"]["files_changed_count"],
+                            "repair_round": next_round,
+                            "max_repair_rounds": max_repairs,
+                        },
+                    )
+                    return {
+                        "ok": False,
+                        "next_action": "repair_available",
+                        "task_id": tid,
+                        "outcome": outcome.__dict__,
+                        "state": state,
+                    }
+
+                self.store.transition(
+                    tid,
+                    state,
+                    STATE_BLOCKED,
+                    event_type="retry_limit_exceeded",
+                    message=f"Post-execution invariant failed ({inv_category}) and max repair rounds ({max_repairs}) reached: {inv_reason}",
+                    failure_category="retry_limit_exceeded",
+                    last_error=inv_reason,
+                    details={
+                        "invariant": inv_category,
+                        "files_changed": state["diff_stats"]["files_changed_count"],
+                        "repair_round": repair_round,
+                        "max_repair_rounds": max_repairs,
+                    },
+                )
+                return {
+                    "ok": False,
+                    "next_action": "blocked_retry_limit",
+                    "task_id": tid,
+                    "outcome": outcome.__dict__,
+                    "state": state,
+                }
+
             # Builder completed cleanly -> move to VERIFYING
             self.store.transition(
                 tid,
@@ -1017,10 +1159,13 @@ class Orchestrator:
             idle_timeout_sec=codex_idle_timeout_sec,
         )
         if not exec_res["ok"]:
+            next_action = exec_res.get("next_action") or (
+                "blocked" if exec_res["state"]["status"] == STATE_BLOCKED else "failed"
+            )
             return {
                 "ok": False,
                 "stage": "execute",
-                "next_action": "blocked" if exec_res["state"]["status"] == STATE_BLOCKED else "failed",
+                "next_action": next_action,
                 "task_id": exec_res["task_id"],
                 "execution": exec_res,
                 "verification": None,

@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "network_access": False,
         "auto_filter_sandbox_tests": True,
         "skip_tests": [],
+        "allow_empty_diff": False,
     },
     "prepare": {
         "enabled": True,

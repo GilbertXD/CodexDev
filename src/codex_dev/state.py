@@ -39,7 +39,7 @@ ALL_STATES = {
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     STATE_CREATED: {STATE_PLANNED, STATE_BLOCKED, STATE_FAILED},
     STATE_PLANNED: {STATE_EXECUTING, STATE_BLOCKED, STATE_FAILED},
-    STATE_EXECUTING: {STATE_VERIFYING, STATE_BLOCKED, STATE_FAILED},
+    STATE_EXECUTING: {STATE_VERIFYING, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
     STATE_VERIFYING: {STATE_REVIEWING, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
     STATE_REVIEWING: {STATE_COMPLETED, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
     STATE_REVISING: {STATE_EXECUTING, STATE_BLOCKED, STATE_FAILED},
@@ -261,7 +261,9 @@ class TaskStore:
             phases["verify"] = "completed"
             phases["review"] = "running"
         elif target_status == STATE_REVISING:
-            if current == STATE_VERIFYING:
+            if current == STATE_EXECUTING:
+                phases["execute"] = "failed"
+            elif current == STATE_VERIFYING:
                 phases["verify"] = "failed"
             elif current == STATE_REVIEWING:
                 phases["review"] = "changes_requested"

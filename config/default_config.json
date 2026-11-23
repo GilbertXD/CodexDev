@@ -27,7 +27,8 @@
   "builder": {
     "network_access": false,
     "auto_filter_sandbox_tests": true,
-    "skip_tests": []
+    "skip_tests": [],
+    "allow_empty_diff": false
   },
   "prepare": {
     "enabled": true,

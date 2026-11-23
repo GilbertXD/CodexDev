@@ -29,6 +29,7 @@ from codex_dev.state import (
     STATE_PLANNED,
     STATE_REVIEWING,
     STATE_REVISING,
+    STATE_VERIFYING,
     StateTransitionError,
     TaskLockError,
     atomic_write_json,
@@ -1390,6 +1391,66 @@ class TestCodexDevOrchestrator(unittest.TestCase):
             contract={"verify_commands": ["go test -race -v ./..."]},
         )
         self.assertEqual(cmds_opt_out[0]["command"], "go test -race -v ./...")
+
+    def test_28_post_execution_invariant_guard_rejects_partial_and_empty_diff(self) -> None:
+        # 1) status='partial' with zero edits is caught BEFORE verification, writes FEEDBACK.md,
+        #    moves EXECUTING -> REVISING (repair_available), and next round auto-escalates and succeeds.
+        repo = _create_python_repo(self.tmp_path / "partial_guard_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "partial_then_success"
+        tid = self.orch.init_task(name="Partial guard escalation", repo_path=repo, complexity="medium")["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+
+        r0 = self.orch.run_round(tid)
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["stage"], "execute")
+        self.assertEqual(r0["next_action"], "repair_available")
+        self.assertIsNone(r0["verification"])
+        self.assertEqual(r0["state"]["status"], STATE_REVISING)
+        self.assertEqual(r0["state"]["failure_category"], "builder_partial")
+        self.assertEqual(r0["state"]["repair_round"], 1)
+        self.assertFalse((self.orch.store.task_dir(tid) / "verification.json").exists())
+        fb = (self.orch.store.task_dir(tid) / "FEEDBACK.md").read_text(encoding="utf-8")
+        self.assertIn("builder_partial", fb)
+        self.assertIn("Implement requested behavior", fb)
+        ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
+        self.assertIn("execution_invariant_failed", ev_types)
+
+        # Round 1 auto-escalates gpt-6-luna -> gpt-6.2-sol and passes verification
+        r1 = self.orch.run_round(tid)
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["stage"], "verify")
+        self.assertEqual(r1["next_action"], "review_required")
+        self.assertEqual(r1["state"]["status"], STATE_REVIEWING)
+        self.assertEqual(r1["state"]["model_policy"]["current_model"], "gpt-6.2-sol")
+
+        # 2) status='completed' with zero diff trips 'empty_diff', and exhausts retries cleanly
+        os.environ["MOCK_CODEX_SCENARIO"] = "empty_diff_completed"
+        tid2 = self.orch.init_task(name="Empty diff blocked", repo_path=repo, max_repair_rounds=1)["task"]["task_id"]
+        self.orch.save_plan(tid2, PLAN_PY)
+        e0 = self.orch.run_round(tid2)
+        self.assertFalse(e0["ok"])
+        self.assertEqual(e0["stage"], "execute")
+        self.assertEqual(e0["next_action"], "repair_available")
+        self.assertEqual(e0["state"]["failure_category"], "empty_diff")
+        self.assertIsNone(e0["verification"])
+
+        e1 = self.orch.run_round(tid2)
+        self.assertFalse(e1["ok"])
+        self.assertEqual(e1["stage"], "execute")
+        self.assertEqual(e1["next_action"], "blocked_retry_limit")
+        self.assertEqual(e1["state"]["status"], STATE_BLOCKED)
+        self.assertEqual(e1["state"]["failure_category"], "retry_limit_exceeded")
+
+        # 3) Explicit opt-in builder.allow_empty_diff=True permits zero-diff completion
+        (repo / ".codex-dev.local.json").write_text(
+            json.dumps({"builder": {"allow_empty_diff": True}}),
+            encoding="utf-8",
+        )
+        tid3 = self.orch.init_task(name="Allowed empty diff", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid3, PLAN_PY)
+        exec3 = self.orch.execute_round(tid3)
+        self.assertTrue(exec3["ok"])
+        self.assertEqual(exec3["state"]["status"], STATE_VERIFYING)
 
 
 if __name__ == "__main__":

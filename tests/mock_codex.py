@@ -240,6 +240,20 @@ def main() -> int:
             encoding="utf-8",
         )
         summary = "Implementation complete; sandbox-safe checks passed, ready for host verify."
+    elif scenario == "partial_empty":
+        summary = "Unable to implement the full plan in this turn; no files were changed."
+    elif scenario == "partial_then_success":
+        if not is_repair:
+            summary = "Bailed out early with zero edits on initial round."
+        else:
+            (wt / "calc.py").write_text(
+                "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+                "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+                encoding="utf-8",
+            )
+            summary = "Implemented multiply() completely on escalated repair round."
+    elif scenario == "empty_diff_completed":
+        summary = "Claimed completion without modifying any worktree files."
     elif scenario == "success":
         (wt / "calc.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b\n\n"
@@ -336,14 +350,32 @@ def main() -> int:
     else:
         emit({"type": "turn.completed"})
 
-    result_obj = {
-        "status": "ready_for_verify" if scenario == "ready_for_verify" else "completed",
-        "summary": summary,
-        "files_changed": ["calc.py"],
-        "commands_run": [{"command": "python3 -m unittest discover -v", "exit_code": 0, "summary": "mock run"}],
-        "acceptance_criteria_status": [
+    is_partial_noop = scenario == "partial_empty" or (scenario == "partial_then_success" and not is_repair)
+    if is_partial_noop:
+        res_status = "partial"
+        res_files: list[str] = []
+        res_criteria = [
+            {"criterion": "Implement requested behavior", "met": False, "evidence": "No files were changed."}
+        ]
+    elif scenario == "empty_diff_completed":
+        res_status = "completed"
+        res_files = []
+        res_criteria = [
+            {"criterion": "Implement requested behavior", "met": True, "evidence": "No-op claim"}
+        ]
+    else:
+        res_status = "ready_for_verify" if scenario == "ready_for_verify" else "completed"
+        res_files = ["calc.py"]
+        res_criteria = [
             {"criterion": "Implement requested behavior", "met": True, "evidence": "Updated source file"}
-        ],
+        ]
+
+    result_obj = {
+        "status": res_status,
+        "summary": summary,
+        "files_changed": res_files,
+        "commands_run": [{"command": "python3 -m unittest discover -v", "exit_code": 0, "summary": "mock run"}],
+        "acceptance_criteria_status": res_criteria,
         "risks_or_notes": [],
     }
     out_file.parent.mkdir(parents=True, exist_ok=True)
