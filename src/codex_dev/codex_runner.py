@@ -127,8 +127,33 @@ def build_codex_prompt(
     feedback_text: str | None,
     repair_round: int,
     worktree_path: Path,
+    builder_checks: list[str] | None = None,
+    builder_network_access: bool = False,
 ) -> str:
     """Build deterministic builder instructions for Codex CLI."""
+    if builder_network_access:
+        sandbox_rule = (
+            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "`GOCACHE`/`GOTMPDIR` outside the worktree and `sandbox_workspace_write.network_access=true` "
+            "(so local loopback servers like 127.0.0.1 and local backing services are reachable, while "
+            "filesystem writes remain confined to the worktree). Prefer running offline/unit package tests "
+            "first and avoid probing `docker info` if Docker is unavailable. The Orchestrator will still "
+            "run full independent host verification after you finish."
+        )
+    else:
+        sandbox_rule = (
+            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
+            "polluting the repo). Prefer running offline/unit package tests that do not require "
+            "outbound network access, loopback port binding (e.g. 127.0.0.1), a live database, or the "
+            "Docker daemon (do NOT probe `docker info` or retry blocked integration tests). The "
+            "`Verification Commands` section in PLAN.md will be executed as independent verification on "
+            "the host by the Orchestrator (including non-sandbox dependency preparation such as `go mod tidy`) after "
+            "you finish. When your implementation is complete and sandbox-safe checks pass, return "
+            "`status: \"ready_for_verify\"` (do NOT mark `status: \"partial\"` merely because host-only "
+            "verification commands have not run inside the sandbox)."
+        )
+
     parts = [
         f"You are the Builder agent executing task '{task_name}' inside an isolated Git worktree.",
         f"Working directory: {worktree_path}",
@@ -137,24 +162,23 @@ def build_codex_prompt(
         "1. Implement the task strictly according to the immutable PLAN below.",
         "2. Do NOT weaken, delete, or skip tests, linters, or type checks to make checks pass.",
         "3. Do NOT run git commit, git push, git merge, or destructive git clean commands.",
-        "4. Run relevant project tests and checks before finishing, and report accurate results.",
+        "4. Run relevant sandbox-safe checks before finishing, and report accurate results.",
         "5. Return your final response strictly conforming to the provided JSON output schema.",
-        (
-            "6. You are running inside a `workspace-write` sandbox with a pre-configured writable "
-            "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
-            "polluting the repo). Prefer running offline/unit package tests that do not require "
-            "outbound network access, loopback port binding (e.g. 127.0.0.1), a live database, or the "
-            "Docker daemon (do NOT probe `docker info` or retry blocked integration tests). If a "
-            "command hits sandbox restrictions, record the limitation honestly in your result and "
-            "finish—do NOT repeatedly attempt workarounds. The Orchestrator will run non-sandbox "
-            "dependency preparation (e.g. `go mod tidy`) and full independent verification after you "
-            "finish."
-        ),
+        sandbox_rule,
         "",
         "=== IMMUTABLE PLAN CONTRACT ===",
         plan_text.strip(),
         "=== END PLAN CONTRACT ===",
     ]
+    if builder_checks:
+        parts.extend(
+            [
+                "",
+                "=== SANDBOX-SAFE BUILDER CHECKS (RUN THESE INSIDE THE SANDBOX) ===",
+                *(f"- `{cmd}`" for cmd in builder_checks),
+                "=== END BUILDER CHECKS ===",
+            ]
+        )
     if repair_round > 0 and feedback_text and feedback_text.strip():
         parts.extend(
             [
@@ -327,6 +351,7 @@ def run_codex_exec(
     builder_env: dict[str, str] | None = None,
     builder_add_dirs: list[str] | None = None,
     builder_isolation: str = "strict",
+    builder_network_access: bool = False,
     on_token_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> CodexRunOutcome:
     """Execute `codex exec` non-interactively, streaming JSONL events into the task store."""
@@ -401,6 +426,8 @@ def run_codex_exec(
         cmd.extend(["-c", "notify=[]"])
     else:
         cmd.extend(["--disable", "api_key_model_discovery"])
+    if sandbox_mode == "workspace-write" and builder_network_access:
+        cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
     for extra_dir in add_dirs:
         cmd.extend(["--add-dir", extra_dir])
     for env_k, env_v in injected_env.items():
@@ -441,6 +468,7 @@ def run_codex_exec(
             "model": model,
             "sandbox": sandbox_mode,
             "builder_isolation": eff_isolation,
+            "builder_network_access": bool(sandbox_mode == "workspace-write" and builder_network_access),
             "isolated_codex_home": str(isolated_codex_home) if isolated_codex_home else None,
             "round": repair_round,
             "attempt": attempt,

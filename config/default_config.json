@@ -22,6 +22,9 @@
   "builder_env": {},
   "builder_add_dirs": [],
   "builder_isolation": "strict",
+  "builder": {
+    "network_access": false
+  },
   "prepare": {
     "enabled": true,
     "auto_go_mod_tidy": true,

@@ -936,6 +936,45 @@ class TestCodexDevOrchestrator(unittest.TestCase):
             else:
                 os.environ["CODEX_HOME"] = orig_codex_home
 
+    def test_21_sandbox_builder_checks_and_network_access_override(self) -> None:
+        repo = _create_python_repo(self.tmp_path / "sandbox_split_repo")
+        rec_file = self.tmp_path / "sandbox_split_record.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
+        os.environ["MOCK_CODEX_SCENARIO"] = "ready_for_verify"
+
+        plan_with_builder_checks = (
+            PLAN_PY
+            + "\n## Builder Checks\n"
+            + "- `python3 -m py_compile calc.py`\n"
+        )
+        tid = self.orch.init_task(name="Sandbox split default", repo_path=repo)["task"]["task_id"]
+        plan_res = self.orch.save_plan(tid, plan_with_builder_checks)
+        self.assertEqual(plan_res["contract"]["builder_checks"], ["python3 -m py_compile calc.py"])
+
+        round_res = self.orch.run_round(tid)
+        self.assertTrue(round_res["ok"])
+        self.assertEqual(round_res["next_action"], "review_required")
+        self.assertEqual(round_res["execution"]["outcome"]["structured_result"]["status"], "ready_for_verify")
+
+        records = json.loads(rec_file.read_text(encoding="utf-8"))
+        self.assertTrue(records[0]["has_builder_checks"])
+        self.assertNotIn("sandbox_workspace_write.network_access=true", records[0]["configs"])
+
+        # Enable per-repo builder.network_access via repo_overrides
+        cfg_path = self.orch.home_dir / "config.json"
+        cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg_data.setdefault("repo_overrides", {})[str(repo.resolve())] = {
+            "builder": {"network_access": True}
+        }
+        cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+
+        tid2 = self.orch.init_task(name="Sandbox network override", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid2, plan_with_builder_checks)
+        exec_res2 = self.orch.execute_round(tid2)
+        self.assertTrue(exec_res2["ok"])
+        records = json.loads(rec_file.read_text(encoding="utf-8"))
+        self.assertIn("sandbox_workspace_write.network_access=true", records[1]["configs"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

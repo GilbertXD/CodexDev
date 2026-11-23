@@ -33,6 +33,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "builder_env": {},
     "builder_add_dirs": [],
     "builder_isolation": "strict",
+    "builder": {
+        "network_access": False,
+    },
     "prepare": {
         "enabled": True,
         "auto_go_mod_tidy": True,

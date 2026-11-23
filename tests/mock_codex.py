@@ -52,6 +52,7 @@ def main() -> int:
                 "sandbox": args.sandbox,
                 "cd": str(wt),
                 "has_feedback": "REPAIR ROUND" in prompt,
+                "has_builder_checks": "SANDBOX-SAFE BUILDER CHECKS" in prompt,
                 "prompt_len": len(prompt),
                 "add_dirs": args.add_dir,
                 "disabled": args.disable,
@@ -163,6 +164,13 @@ def main() -> int:
         (wt / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n", encoding="utf-8")
         (wt / "main.go").write_text("package main\n\nfunc main() {}\n", encoding="utf-8")
         summary = "Updated go.mod and main.go."
+    elif scenario == "ready_for_verify":
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Implementation complete; sandbox-safe checks passed, ready for host verify."
     elif scenario == "success":
         (wt / "calc.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b\n\n"
@@ -257,7 +265,7 @@ def main() -> int:
     )
 
     result_obj = {
-        "status": "completed",
+        "status": "ready_for_verify" if scenario == "ready_for_verify" else "completed",
         "summary": summary,
         "files_changed": ["calc.py"],
         "commands_run": [{"command": "python3 -m unittest discover -v", "exit_code": 0, "summary": "mock run"}],

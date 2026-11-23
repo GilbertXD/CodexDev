@@ -85,6 +85,17 @@ def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
         elif item:
             verify_commands.append(item)
 
+    builder_checks_raw = collect_bullets(
+        ("builder check", "sandbox check", "offline check", "沙箱检查", "构建检查")
+    )
+    builder_checks: list[str] = []
+    for item in builder_checks_raw:
+        bt = re.findall(r"`([^`]+)`", item)
+        if bt:
+            builder_checks.append(bt[0].strip())
+        elif item:
+            builder_checks.append(item)
+
     prepare_cmds_raw = collect_bullets(
         ("prepare", "dependency prep", "预处理", "依赖准备")
     )
@@ -100,6 +111,7 @@ def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
         "acceptance_criteria": acceptance_criteria,
         "target_files": list(dict.fromkeys(target_files)),
         "verify_commands": list(dict.fromkeys(verify_commands)),
+        "builder_checks": list(dict.fromkeys(builder_checks)),
         "prepare_commands": list(dict.fromkeys(prepare_commands)),
     }
 
@@ -109,6 +121,7 @@ def save_immutable_contract(
     plan_text: str,
     *,
     explicit_verify_commands: list[str] | None = None,
+    explicit_builder_checks: list[str] | None = None,
     explicit_prepare_commands: list[str] | None = None,
     explicit_target_files: list[str] | None = None,
     allow_replan: bool = False,
@@ -130,6 +143,11 @@ def save_immutable_contract(
         if explicit_verify_commands is not None
         else parsed["verify_commands"]
     )
+    builder_checks = (
+        list(explicit_builder_checks)
+        if explicit_builder_checks is not None
+        else parsed["builder_checks"]
+    )
     prepare_cmds = (
         list(explicit_prepare_commands)
         if explicit_prepare_commands is not None
@@ -149,6 +167,7 @@ def save_immutable_contract(
         "acceptance_criteria": parsed["acceptance_criteria"],
         "target_files": target_files,
         "verify_commands": verify_cmds,
+        "builder_checks": builder_checks,
         "prepare_commands": prepare_cmds,
         "created_at": utc_now(),
     }

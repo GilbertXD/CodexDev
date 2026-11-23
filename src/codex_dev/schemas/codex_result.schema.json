@@ -14,7 +14,7 @@
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["completed", "partial", "blocked", "failed"]
+      "enum": ["completed", "ready_for_verify", "partial", "blocked", "failed"]
     },
     "summary": {
       "type": "string"

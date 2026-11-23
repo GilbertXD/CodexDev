@@ -419,6 +419,10 @@ class Orchestrator:
             )
 
             plan_text = (tdir / "PLAN.md").read_text(encoding="utf-8")
+            contract_doc = read_json(tdir / "contract.json") or {}
+            builder_checks = list(contract_doc.get("builder_checks") or [])
+            builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
+            builder_network_access = bool(builder_cfg.get("network_access", False))
             feedback_path = tdir / "FEEDBACK.md"
             feedback_text = feedback_path.read_text(encoding="utf-8") if feedback_path.is_file() else None
             worktree_path = Path(meta["worktree_path"])
@@ -429,6 +433,8 @@ class Orchestrator:
                 feedback_text=feedback_text,
                 repair_round=repair_round,
                 worktree_path=worktree_path,
+                builder_checks=builder_checks or None,
+                builder_network_access=builder_network_access,
             )
 
             eff_timeout, eff_idle_timeout = resolve_codex_timeouts(
@@ -461,6 +467,7 @@ class Orchestrator:
                 builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
                 builder_add_dirs=cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
                 builder_isolation=str(cfg.get("builder_isolation") or "strict"),
+                builder_network_access=builder_network_access,
                 on_token_usage=_live_usage_cb,
             )
 
