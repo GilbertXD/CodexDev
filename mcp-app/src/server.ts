@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -14,6 +14,8 @@ import { formatPlainTextSummary, readMonitorSnapshot } from "./stateReader.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MONITOR_URI = "ui://codex-dev/monitor.html";
 
+let cachedHtml: { path: string; mtimeMs: number; text: string } | null = null;
+
 function loadMonitorHtml(): string {
   const candidates = [
     join(__dirname, "monitor.html"),
@@ -23,7 +25,18 @@ function loadMonitorHtml(): string {
   ];
   for (const p of candidates) {
     if (existsSync(p)) {
-      return readFileSync(p, "utf-8");
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(p).mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      if (cachedHtml && cachedHtml.path === p && cachedHtml.mtimeMs === mtimeMs) {
+        return cachedHtml.text;
+      }
+      const text = readFileSync(p, "utf-8");
+      cachedHtml = { path: p, mtimeMs, text };
+      return text;
     }
   }
   throw new Error(`Bundled monitor HTML not found. Searched: ${candidates.join(", ")}`);
@@ -68,7 +81,8 @@ export function createMonitorServer(): McpServer {
       },
     },
     async (args: { task_id?: string }) => {
-      const snapshot = readMonitorSnapshot(args?.task_id);
+      // Lightweight initial snapshot so open_monitor responds immediately; UI polls full history via get_monitor_snapshot.
+      const snapshot = readMonitorSnapshot(args?.task_id, 40);
       return {
         content: [
           {

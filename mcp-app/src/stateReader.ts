@@ -1,6 +1,18 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+
+const MAX_TASKS_LISTED = 25;
+const MAX_EVENTS_TAIL_BYTES = 256 * 1024;
+const MAX_SUMMARY_CACHE_ENTRIES = 200;
+
+interface CachedTaskSummary {
+  stateMtimeMs: number;
+  metaMtimeMs: number;
+  item: TaskSummaryItem;
+}
+
+const taskSummaryCache = new Map<string, CachedTaskSummary>();
 
 export interface TaskSummaryItem {
   task_id: string;
@@ -50,13 +62,32 @@ function safeReadJson<T>(filePath: string, fallback: T): T {
 }
 
 function safeReadEvents(filePath: string, limit = 80): Array<Record<string, unknown>> {
+  let fd: number | null = null;
   try {
     if (!existsSync(filePath)) return [];
-    const lines = readFileSync(filePath, "utf-8").split(/\r?\n/);
+    fd = openSync(filePath, "r");
+    const size = fstatSync(fd).size;
+    if (size <= 0) return [];
+
+    let raw: string;
+    if (size <= MAX_EVENTS_TAIL_BYTES) {
+      const buf = Buffer.allocUnsafe(size);
+      const read = readSync(fd, buf, 0, size, 0);
+      raw = buf.subarray(0, read).toString("utf-8");
+    } else {
+      const offset = size - MAX_EVENTS_TAIL_BYTES;
+      const buf = Buffer.allocUnsafe(MAX_EVENTS_TAIL_BYTES);
+      const read = readSync(fd, buf, 0, MAX_EVENTS_TAIL_BYTES, offset);
+      raw = buf.subarray(0, read).toString("utf-8");
+      // Drop potentially truncated leading partial line when slicing from mid-file
+      const nl = raw.indexOf("\n");
+      raw = nl >= 0 ? raw.slice(nl + 1) : "";
+    }
+
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
     const out: Array<Record<string, unknown>> = [];
     for (const line of lines.slice(-limit)) {
       const s = line.trim();
-      if (!s) continue;
       try {
         const parsed = JSON.parse(s);
         if (parsed && typeof parsed === "object") {
@@ -69,7 +100,54 @@ function safeReadEvents(filePath: string, limit = 80): Array<Record<string, unkn
     return out;
   } catch {
     return [];
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close error
+      }
+    }
   }
+}
+
+function readCachedTaskSummary(tdir: string, dirName: string, stateMtimeMs: number): TaskSummaryItem | null {
+  const statePath = join(tdir, "state.json");
+  const metaPath = join(tdir, "task.json");
+  const metaMtimeMs = safeMtime(metaPath);
+  const cacheKey = `${tdir}`;
+  const cached = taskSummaryCache.get(cacheKey);
+  if (cached && cached.stateMtimeMs === stateMtimeMs && cached.metaMtimeMs === metaMtimeMs) {
+    return cached.item;
+  }
+
+  const state = safeReadJson<Record<string, unknown> | null>(statePath, null);
+  const meta = safeReadJson<Record<string, unknown> | null>(metaPath, null);
+  if (!state) return null;
+
+  const repoPath = typeof meta?.repo_path === "string" ? meta.repo_path : "";
+  const modelPolicy =
+    state.model_policy && typeof state.model_policy === "object"
+      ? (state.model_policy as Record<string, unknown>)
+      : {};
+  const item: TaskSummaryItem = {
+    task_id: dirName,
+    name: String(meta?.name || state.name || dirName),
+    repo_name: repoPath ? basename(repoPath) : "repository",
+    repo_path: repoPath,
+    branch: String(meta?.branch || ""),
+    status: String(state.status || "CREATED"),
+    current_phase: String(state.current_phase || "plan"),
+    current_model: typeof modelPolicy.current_model === "string" ? modelPolicy.current_model : null,
+    repair_round: Number(state.repair_round ?? 0),
+    max_repair_rounds: Number(state.max_repair_rounds ?? 3),
+    updated_at: String(state.updated_at || meta?.created_at || ""),
+  };
+  if (taskSummaryCache.size >= MAX_SUMMARY_CACHE_ENTRIES) {
+    taskSummaryCache.clear();
+  }
+  taskSummaryCache.set(cacheKey, { stateMtimeMs, metaMtimeMs, item });
+  return item;
 }
 
 function safeMtime(filePath: string): number {
@@ -102,33 +180,30 @@ export function readMonitorSnapshot(requestedTaskId?: string, eventsLimit = 80):
     } catch {
       entries = [];
     }
+    const candidates: Array<{ dirName: string; tdir: string; stateMtimeMs: number }> = [];
     for (const dirName of entries) {
       if (!isSafeTaskId(dirName)) continue;
       const tdir = join(tasksDir, dirName);
-      const statePath = join(tdir, "state.json");
-      if (!existsSync(statePath)) continue;
-      const state = safeReadJson<Record<string, unknown> | null>(statePath, null);
-      const meta = safeReadJson<Record<string, unknown> | null>(join(tdir, "task.json"), null);
-      if (!state) continue;
-
-      const repoPath = typeof meta?.repo_path === "string" ? meta.repo_path : "";
-      const modelPolicy =
-        state.model_policy && typeof state.model_policy === "object"
-          ? (state.model_policy as Record<string, unknown>)
-          : {};
-      tasks.push({
-        task_id: dirName,
-        name: String(meta?.name || state.name || dirName),
-        repo_name: repoPath ? basename(repoPath) : "repository",
-        repo_path: repoPath,
-        branch: String(meta?.branch || ""),
-        status: String(state.status || "CREATED"),
-        current_phase: String(state.current_phase || "plan"),
-        current_model: typeof modelPolicy.current_model === "string" ? modelPolicy.current_model : null,
-        repair_round: Number(state.repair_round ?? 0),
-        max_repair_rounds: Number(state.max_repair_rounds ?? 3),
-        updated_at: String(state.updated_at || meta?.created_at || ""),
-      });
+      const stateMtimeMs = safeMtime(join(tdir, "state.json"));
+      if (stateMtimeMs <= 0) continue;
+      candidates.push({ dirName, tdir, stateMtimeMs });
+    }
+    // Stat-sort newest first and only parse top MAX_TASKS_LISTED (+ requested/active) to keep open_monitor sub-10ms.
+    candidates.sort((a, b) => b.stateMtimeMs - a.stateMtimeMs);
+    const toParse = candidates.slice(0, MAX_TASKS_LISTED);
+    const included = new Set(toParse.map((c) => c.dirName));
+    for (const pinned of [requestedTaskId, activeTaskId]) {
+      if (pinned && !included.has(pinned)) {
+        const match = candidates.find((c) => c.dirName === pinned);
+        if (match) {
+          toParse.push(match);
+          included.add(pinned);
+        }
+      }
+    }
+    for (const cand of toParse) {
+      const summary = readCachedTaskSummary(cand.tdir, cand.dirName, cand.stateMtimeMs);
+      if (summary) tasks.push(summary);
     }
   }
 

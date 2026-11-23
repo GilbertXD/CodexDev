@@ -201,7 +201,47 @@ try {
   const pollCall = await rpc(5, "tools/call", { name: "get_monitor_snapshot", arguments: { task_id: taskId } });
   assert.equal(pollCall.result?.structuredContent?.events?.length, 1);
 
-  console.log(`  OK: MCP App server (${serverPath}) passed all protocol, read-only, aux_pane, UI resource, and live state checks.`);
+  // 5. Verify tail-only reading on large (>300KB) events.jsonl & bounded task listing (>30 tasks)
+  const bigLines = [];
+  for (let i = 1; i <= 1800; i++) {
+    bigLines.push(
+      JSON.stringify({
+        seq: i,
+        timestamp: new Date().toISOString(),
+        phase: "execute",
+        agent: "Codex CLI (Builder)",
+        type: "codex_command",
+        message: `Event ${i} ${"x".repeat(160)}`,
+      }),
+    );
+  }
+  writeFileSync(join(taskDir, "events.jsonl"), `${bigLines.join("\n")}\n`);
+  for (let j = 1; j <= 30; j++) {
+    const oldId = `cd-20261101-old${String(j).padStart(2, "0")}`;
+    const oldDir = join(tempHome, "tasks", oldId);
+    mkdirSync(oldDir, { recursive: true });
+    writeFileSync(join(oldDir, "task.json"), JSON.stringify({ task_id: oldId, name: `Old ${j}`, repo_path: "/tmp/old" }));
+    writeFileSync(
+      join(oldDir, "state.json"),
+      JSON.stringify({
+        task_id: oldId,
+        name: `Old ${j}`,
+        status: "COMPLETED",
+        current_phase: "deliver",
+        updated_at: `2026-11-01T00:${String(j).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+  }
+  const t0 = Date.now();
+  const bigCall = await rpc(6, "tools/call", { name: "get_monitor_snapshot", arguments: { task_id: taskId, events_limit: 25 } });
+  const elapsedMs = Date.now() - t0;
+  const bigSc = bigCall.result?.structuredContent;
+  assert.equal(bigSc?.events?.length, 25);
+  assert.equal(bigSc?.events?.[24]?.seq, 1800);
+  assert.equal(bigSc?.tasks?.length, 25);
+  assert.ok(elapsedMs < 2000, `Expected fast bounded snapshot read, took ${elapsedMs}ms`);
+
+  console.log(`  OK: MCP App server (${serverPath}) passed all protocol, read-only, aux_pane, UI resource, tail-read, and live state checks (${elapsedMs}ms).`);
 } finally {
   child.kill();
   rmSync(tempHome, { recursive: true, force: true });
