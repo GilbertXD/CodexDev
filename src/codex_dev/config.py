@@ -50,6 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verify": {
         "commands": [],
         "env": {},
+        "no_cache": True,
     },
     "repo_overrides": {},
     "model_policy": {

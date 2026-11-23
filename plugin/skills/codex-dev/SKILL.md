@@ -58,8 +58,8 @@ Write a clear, testable `PLAN.md` containing:
 - `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, environment variables, or database migrations/schema changes, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, config templates, and existing migration/rollback integration tests up front to avoid avoidable `unexpected_files` audit warnings or regression failures)
 - `## Implementation Plan`
 - `## Acceptance Criteria` (concrete, verifiable checklist items)
-- `## Builder Checks` (optional sandbox-safe offline checks for Codex CLI to run inside `workspace-write`, e.g., `go vet ./...`, `go test -short ./...`, `make build`)
-- `## Verification Commands` (authoritative host-level test, build, lint, typecheck commands in backticks; if a task requires task-specific env vars such as live smoke test targets, pass repeatable `--verify-env KEY=VALUE` on `init`/`plan`/`verify`/`run-round`)
+- `## Builder Checks` (optional sandbox-safe offline checks for Codex CLI to run inside `workspace-write`, e.g., `go vet ./...`, `go test -short ./...`, `make build`; in offline sandboxes the orchestrator automatically defers detected socket/loopback-binding tests to host verification without modifying repo code)
+- `## Verification Commands` (authoritative host-level test, build, lint, typecheck commands in backticks; caching test runners are automatically normalized with no-cache flags such as `go test -count=1` and `jest --no-cache` unless `verify.no_cache: false`; if a task requires task-specific env vars such as live smoke test targets, pass repeatable `--verify-env KEY=VALUE` on `init`/`plan`/`verify`/`run-round`)
 - `## Out of Scope`
 
 Lock the contract via stdin so the user never copies anything:

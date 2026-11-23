@@ -334,6 +334,35 @@ def run_dependency_prepare(
     return report
 
 
+def apply_no_cache_verify_command(cmd: str) -> str:
+    """Disable stale test-result caching on authoritative host verification commands across runners."""
+    s = cmd.strip()
+    if not s:
+        return s
+    # Go test caches passing package results unless -count=1 is set
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*go\s+test\b", s):
+        if not re.search(r"(?:^|\s)-count(?:=|\s)", s):
+            return re.sub(r"(\bgo\s+test\b)", r"\1 -count=1", s, count=1)
+        return s
+    # Jest transform/test cache
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:npx|pnpm|yarn|bunx)\s+)?jest\b", s):
+        if not re.search(r"(?:^|\s)--(?:no-)?cache\b", s):
+            return f"{s} --no-cache"
+        return s
+    # Turborepo test task caching
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:npx|pnpm|yarn|bunx)\s+)?turbo\s+(?:run\s+)?test\b", s):
+        if not re.search(r"(?:^|\s)(?:--force|--no-cache)\b", s):
+            return f"{s} --force"
+        return s
+    return s
+
+
+def _apply_no_cache_list(items: list[dict[str, str]], enabled: bool) -> list[dict[str, str]]:
+    if not enabled:
+        return items
+    return [{**item, "command": apply_no_cache_verify_command(item["command"])} for item in items]
+
+
 def detect_verification_commands(
     worktree_path: Path,
     config: dict[str, Any],
@@ -348,19 +377,21 @@ def detect_verification_commands(
       3. Repository / global config `verify.commands`
       4. Auto-detected stack commands (Node/TS, Python, Go, Rust, Makefile)
     """
+    cfg_verify = config.get("verify") or {}
+    no_cache = bool(cfg_verify.get("no_cache", True)) if isinstance(cfg_verify, dict) else True
+
     if explicit_commands:
-        return ("explicit", _normalize_cmd_list(explicit_commands, default_kind="custom", prefix="check"))
+        return ("explicit", _apply_no_cache_list(_normalize_cmd_list(explicit_commands, default_kind="custom", prefix="check"), no_cache))
 
     if contract and contract.get("verify_commands"):
         norm = _normalize_cmd_list(contract["verify_commands"], default_kind="custom", prefix="check")
         if norm:
-            return ("plan_contract", norm)
+            return ("plan_contract", _apply_no_cache_list(norm, no_cache))
 
-    cfg_verify = config.get("verify") or {}
     if isinstance(cfg_verify, dict) and cfg_verify.get("commands"):
         norm = _normalize_cmd_list(cfg_verify["commands"], default_kind="custom", prefix="check")
         if norm:
-            return ("config", norm)
+            return ("config", _apply_no_cache_list(norm, no_cache))
 
     # Auto-detect project stack without hardcoding a single language
     detected: list[dict[str, str]] = []
@@ -390,7 +421,7 @@ def detect_verification_commands(
 
     if (worktree_path / "go.mod").is_file():
         detected.append({"name": "go:vet", "command": "go vet ./...", "kind": "lint"})
-        detected.append({"name": "go:test", "command": "go test ./...", "kind": "test"})
+        detected.append({"name": "go:test", "command": "go test -count=1 ./...", "kind": "test"})
 
     if (worktree_path / "Cargo.toml").is_file():
         detected.append({"name": "cargo:test", "command": "cargo test", "kind": "test"})

@@ -38,7 +38,8 @@
   },
   "verify": {
     "commands": [],
-    "env": {}
+    "env": {},
+    "no_cache": true
   },
   "repo_overrides": {},
   "model_policy": {

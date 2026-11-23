@@ -1354,6 +1354,43 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
         self.assertIn("builder_checks_filtered", ev_types)
 
+    def test_27_host_verify_no_cache_normalization(self) -> None:
+        from codex_dev.verifier import apply_no_cache_verify_command, detect_verification_commands
+
+        # Stack-agnostic no-cache injection
+        self.assertEqual(apply_no_cache_verify_command("go test -race -v ./..."), "go test -count=1 -race -v ./...")
+        self.assertEqual(apply_no_cache_verify_command("CGO_ENABLED=1 go test ./..."), "CGO_ENABLED=1 go test -count=1 ./...")
+        self.assertEqual(apply_no_cache_verify_command("go test -count=2 ./..."), "go test -count=2 ./...")
+        self.assertEqual(apply_no_cache_verify_command("npx jest"), "npx jest --no-cache")
+        self.assertEqual(apply_no_cache_verify_command("jest --cache"), "jest --cache")
+        self.assertEqual(apply_no_cache_verify_command("npx turbo run test"), "npx turbo run test --force")
+        self.assertEqual(apply_no_cache_verify_command("python3 -m unittest discover -v"), "python3 -m unittest discover -v")
+
+        # Auto-detected Go repo and plan_contract both receive -count=1 when verify.no_cache is enabled
+        go_dir = self.tmp_path / "go_nocache_repo"
+        go_dir.mkdir(parents=True)
+        (go_dir / "go.mod").write_text("module example.com/demo\n\ngo 1.25\n", encoding="utf-8")
+        src_auto, cmds_auto = detect_verification_commands(go_dir, DEFAULT_CONFIG)
+        self.assertEqual(src_auto, "auto_detected")
+        self.assertEqual(cmds_auto[1]["command"], "go test -count=1 ./...")
+
+        _, cmds_contract = detect_verification_commands(
+            go_dir,
+            DEFAULT_CONFIG,
+            contract={"verify_commands": ["go vet ./...", "go test -race -v ./..."]},
+        )
+        self.assertEqual(cmds_contract[0]["command"], "go vet ./...")
+        self.assertEqual(cmds_contract[1]["command"], "go test -count=1 -race -v ./...")
+
+        # Opt-out via verify.no_cache=False leaves commands verbatim
+        cfg_opt_out = {**DEFAULT_CONFIG, "verify": {**DEFAULT_CONFIG["verify"], "no_cache": False}}
+        _, cmds_opt_out = detect_verification_commands(
+            go_dir,
+            cfg_opt_out,
+            contract={"verify_commands": ["go test -race -v ./..."]},
+        )
+        self.assertEqual(cmds_opt_out[0]["command"], "go test -race -v ./...")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
