@@ -1766,6 +1766,135 @@ Add standalone documents with migration, API, and integration tests.
         self.assertIn("`go.mod`", rec["prompt"])
         self.assertIn("Do NOT attempt network downloads", rec["prompt"])
 
+    def test_32_failed_verify_full_logs_and_failure_context_excerpt(self) -> None:
+        from codex_dev.verifier import extract_failure_excerpt
+
+        # 1) Unit test: failure signal buried before huge teardown/cleanup tail is preserved in excerpt
+        teardown_noise = "\n".join(f"Container demo-service-{i} Removing" for i in range(250))
+        noisy_stderr = (
+            "Step 1: boot stack\n"
+            "Step 2: check readiness\n"
+            "Timed out waiting for readiness with Redis ok\n"
+            "GET /readyz returned 503, expected 200\n"
+            + teardown_noise
+            + "\nNetwork demo_default Removed\n"
+        )
+        excerpt = extract_failure_excerpt(noisy_stderr, max_chars=1200)
+        self.assertIn("Timed out waiting for readiness with Redis ok", excerpt)
+        self.assertIn("GET /readyz returned 503, expected 200", excerpt)
+        self.assertIn("truncated; see full log file", excerpt)
+        self.assertIn("Network demo_default Removed", excerpt)
+
+        # 2) End-to-end verification persists full logs under verify_logs/ and surfaces excerpt + log paths in FEEDBACK.md
+        repo = _create_python_repo(self.tmp_path / "verify_logs_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Verify failure log persistence", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.execute_round(tid)
+
+        noisy_fail_cmd = (
+            "python3 -c \""
+            "import sys; "
+            "print('setup ok'); "
+            "print('Timed out waiting for readiness with Redis ok', file=sys.stderr); "
+            "print('GET /api/v1/ping returned 503, expected 200', file=sys.stderr); "
+            "print('\\n'.join(f'Container e2e-svc-{i} Removing' for i in range(300)), file=sys.stderr); "
+            "sys.exit(1)\""
+        )
+        ver = self.orch.verify_task(tid, verify_commands=[noisy_fail_cmd])
+        self.assertFalse(ver["ok"])
+        self.assertEqual(ver["next_action"], "repair_available")
+        chk = ver["report"]["checks"][0]
+        self.assertTrue(chk.get("stderr_log_path"))
+        self.assertTrue(chk.get("stdout_log_path"))
+        stderr_log = Path(chk["stderr_log_path"])
+        stdout_log = Path(chk["stdout_log_path"])
+        self.assertTrue(stderr_log.is_file())
+        self.assertTrue(stdout_log.is_file())
+        self.assertIn("Timed out waiting for readiness with Redis ok", stderr_log.read_text(encoding="utf-8"))
+        self.assertIn("Container e2e-svc-299 Removing", stderr_log.read_text(encoding="utf-8"))
+        # Summary check exposes log path for failed checks
+        sum_chk = ver["state"]["verification_summary"]["checks"][0]
+        self.assertEqual(sum_chk.get("stderr_log_path"), str(stderr_log))
+        # Auto-generated FEEDBACK.md preserves root cause + points to full log file
+        fb = (self.orch.store.task_dir(tid) / "FEEDBACK.md").read_text(encoding="utf-8")
+        self.assertIn("Timed out waiting for readiness with Redis ok", fb)
+        self.assertIn("GET /api/v1/ping returned 503, expected 200", fb)
+        self.assertIn(str(stderr_log), fb)
+
+    def test_33_same_package_companion_audit_ack_warning_and_rm_prompt_rule(self) -> None:
+        from codex_dev.verifier import audit_diff_integrity
+
+        # 1) Builder prompt warns against shell `rm -f`/`rm -rf` so Codex CLI policy does not reject inline cleanup
+        prompt = build_codex_prompt(
+            task_name="Sandbox rm hygiene",
+            plan_text=PLAN_PY,
+            feedback_text=None,
+            repair_round=0,
+            worktree_path=self.tmp_path,
+        )
+        self.assertIn("rm -f", prompt)
+        self.assertIn("tempfile.TemporaryDirectory()", prompt)
+
+        # 2) Same-package modified companion source file does not trigger noisy unexpected_files,
+        #    while unrelated files, root siblings, new files, and undeclared test/config files still do.
+        contract = {
+            "target_files": [
+                "internal/gitscan/remote_source.go",
+                "calc.py",
+            ]
+        }
+        diff_info = {
+            "all_changed_files": [
+                "internal/gitscan/remote_source.go",
+                "internal/gitscan/git.go",           # same-package modified companion -> NOT unexpected
+                "internal/gitscan/new_helper.go",    # newly added (not modified) -> still unexpected
+                "internal/gitscan/git_test.go",      # undeclared test file -> still unexpected
+                "other_root.py",                     # repo-root sibling -> still unexpected
+                "internal/other/file.go",            # different package -> still unexpected
+            ],
+            "modified": [
+                "internal/gitscan/remote_source.go",
+                "internal/gitscan/git.go",
+                "internal/gitscan/git_test.go",
+                "other_root.py",
+                "internal/other/file.go",
+            ],
+            "deleted": [],
+            "full_diff": "",
+        }
+        audit = audit_diff_integrity(diff_info, contract)
+        self.assertEqual(audit["same_package_companions"], ["internal/gitscan/git.go"])
+        self.assertEqual(
+            audit["unexpected_files"],
+            [
+                "internal/gitscan/new_helper.go",
+                "internal/gitscan/git_test.go",
+                "other_root.py",
+                "internal/other/file.go",
+            ],
+        )
+
+        # 3) Reviewer --ack-warning persists acknowledged warnings across review, state, and execution log
+        repo = _create_python_repo(self.tmp_path / "ack_warn_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Review ack warning", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.run_round(tid)
+        ack_msg = "skipped_tests: 4 pre-existing live scanner tests require external repo env vars"
+        rev = self.orch.record_review(
+            tid,
+            verdict="approve",
+            summary="Approved with acknowledged pre-existing skips.",
+            acknowledged_warnings=[ack_msg],
+        )
+        self.assertTrue(rev["ok"])
+        self.assertEqual(rev["review"]["acknowledged_warnings"], [ack_msg])
+        self.assertEqual(rev["state"]["verification_summary"]["acknowledged_warnings"], [ack_msg])
+        exec_log = (self.orch.store.task_dir(tid) / "EXECUTION_LOG.md").read_text(encoding="utf-8")
+        self.assertIn("Acknowledged Warnings", exec_log)
+        self.assertIn(ack_msg, exec_log)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

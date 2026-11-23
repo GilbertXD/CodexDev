@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     rvp.add_argument("--feedback", default="", help="Detailed feedback text.")
     rvp.add_argument("--feedback-file", default=None, help="Read detailed feedback from file.")
     rvp.add_argument("--issue", action="append", default=None, help="Specific blocking issue (repeatable).")
+    rvp.add_argument(
+        "--ack-warning",
+        action="append",
+        default=None,
+        help="Explicitly acknowledge a justified verification/diff-audit warning (repeatable).",
+    )
     rvp.add_argument("--reviewer-model", default=None, help="Explicit reviewer model (only used if routing_supported=true).")
 
     # status
@@ -274,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary=args.summary,
                 feedback=fb,
                 issues=args.issue,
+                acknowledged_warnings=args.ack_warning,
                 reviewer_model=args.reviewer_model,
             )
             _print_json(res)

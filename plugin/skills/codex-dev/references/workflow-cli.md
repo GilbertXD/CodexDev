@@ -16,7 +16,7 @@ All commands output structured JSON to stdout.
 - `codex-dev prepare [--task-id <id>] [--prepare-cmd <cmd>] [--timeout <sec>]`
 - `codex-dev verify [--task-id <id>] [--verify-cmd <cmd>] [--verify-env KEY=VAL] [--prepare-cmd <cmd>] [--skip-prepare] [--timeout <sec>] [--from-failed]`
 - `codex-dev run-round [--task-id <id>] [--model <id>] [--reasoning-effort low|medium|high|xhigh] [--codex-timeout <sec>] [--codex-idle-timeout <sec>] [--verify-cmd <cmd>] [--verify-env KEY=VAL] [--prepare-cmd <cmd>] [--skip-prepare] [--verify-timeout <sec>]`
-- `codex-dev review [--task-id <id>] --verdict <approve|request_changes|block> --summary <text> [--issue <item>]... [--feedback <text>]`
+- `codex-dev review [--task-id <id>] --verdict <approve|request_changes|block> --summary <text> [--issue <item>]... [--ack-warning <note>]... [--feedback <text>]`
 
 ## Inspection, Control & Delivery
 

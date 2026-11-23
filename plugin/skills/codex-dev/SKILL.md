@@ -55,7 +55,7 @@ You are the **Architect** and **Reviewer**. **Codex CLI** is the **Builder**. Th
 ### Step 2 — Author Immutable Plan Contract (`PLANNED`)
 Write a clear, testable `PLAN.md` containing:
 - `## Goal`
-- `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, environment variables, or database migrations/schema changes, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, config templates, and existing migration/rollback integration tests up front to avoid avoidable `unexpected_files` audit warnings or regression failures)
+- `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, environment variables, or database migrations/schema changes, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, config templates, existing migration/rollback integration tests, and any sibling source files sharing package-internal types/helpers up front to avoid avoidable `unexpected_files` audit warnings or regression failures)
 - `## Implementation Plan`
 - `## Acceptance Criteria` (concrete, verifiable checklist items)
 - `## Builder Checks` (optional sandbox-safe offline checks for Codex CLI to run inside `workspace-write`, e.g., `go vet ./...`, `go test -short ./...`, `make build`; in offline sandboxes the orchestrator automatically defers detected socket/loopback-binding tests to host verification without modifying repo code)
@@ -76,7 +76,7 @@ codex-dev run-round --task-id <task_id>
 ```
 Check the returned JSON `next_action`:
 - `review_required` → Proceed to **Step 4 (Code Review)**.
-- `repair_available` → Either post-execution invariant guard rejected an incomplete/no-op Builder exit (`builder_partial` / `empty_diff`, skipping wasted verification) or host verification failed; `FEEDBACK.md` was generated automatically. Inspect the failure, enrich `FEEDBACK.md` if needed, and re-run `codex-dev run-round --task-id <task_id>` (up to 3 total repair rounds; in `auto` mode the orchestrator escalates model/effort automatically).
+- `repair_available` → Either post-execution invariant guard rejected an incomplete/no-op Builder exit (`builder_partial` / `empty_diff`, skipping wasted verification) or host verification failed; `FEEDBACK.md` was generated automatically with failure-context excerpts and full persisted log paths (`verify_logs/*.log` / `stdout_log_path` / `stderr_log_path`). Inspect the failure (reading the persisted full log if truncated), enrich `FEEDBACK.md` if needed, and re-run `codex-dev run-round --task-id <task_id>` (up to 3 total repair rounds; in `auto` mode the orchestrator escalates model/effort automatically).
 - `blocked_retry_limit` → Max repair rounds (3) reached. Stop and report diagnostics clearly to the user.
 - `blocked_dependency_prepare` → Non-sandbox dependency preparation (e.g., `go mod tidy` after `go.mod` edits) failed (`failure_category == "dependency_prepare_failure"`). Repair rounds were **not** consumed; inspect network/proxy config (e.g., `verify.env.GOPROXY` in `~/.codex-dev/config.json`) or dependency versions and re-run `codex-dev verify` once resolved.
 - `failed` or `blocked` → Inspect `state.failure_category` (`execution_failure`, `builder_blocked`, `timeout`, `cancelled`, `invalid_model`, `contract_violation`, `dependency_prepare_failure`). If `failure_category == "timeout"` and `codex-dev diff --summary-only` shows the Builder already wrote substantial changes to the worktree, you may explicitly run `codex-dev verify --task-id <task_id> --from-failed` to verify existing worktree artifacts without re-running the Builder; otherwise report clearly to the user.
@@ -97,7 +97,7 @@ When state is `REVIEWING`:
 4. Record the verdict:
    - If satisfied:
      ```bash
-     codex-dev review --task-id <task_id> --verdict approve --summary "<concise approval conclusion>"
+     codex-dev review --task-id <task_id> --verdict approve --summary "<concise approval conclusion>" [--ack-warning "<justified audit warning note>"]
      ```
    - If issues found:
      ```bash

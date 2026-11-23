@@ -220,10 +220,19 @@ def _format_verification_feedback(report: dict[str, Any], repair_round: int) -> 
     for chk in report.get("checks", []):
         if not chk.get("passed"):
             lines.append(f"## Failed Check: `{chk['name']}` (`{chk['command']}`, exit={chk['exit_code']})")
-            if chk.get("stdout_tail"):
-                lines.extend(["```text", chk["stdout_tail"][-1500:].strip(), "```"])
-            if chk.get("stderr_tail"):
-                lines.extend(["```text", chk["stderr_tail"][-1500:].strip(), "```"])
+            log_refs: list[str] = []
+            if chk.get("stdout_log_path"):
+                log_refs.append(f"stdout=`{chk['stdout_log_path']}`")
+            if chk.get("stderr_log_path"):
+                log_refs.append(f"stderr=`{chk['stderr_log_path']}`")
+            if log_refs:
+                lines.append(f"- Full logs: {', '.join(log_refs)}")
+            stdout_body = str(chk.get("stdout_excerpt") or (chk.get("stdout_tail") or "")[-1500:]).strip()
+            stderr_body = str(chk.get("stderr_excerpt") or (chk.get("stderr_tail") or "")[-1500:]).strip()
+            if stdout_body:
+                lines.extend(["```text", stdout_body, "```"])
+            if stderr_body:
+                lines.extend(["```text", stderr_body, "```"])
             lines.append("")
     return "\n".join(lines).strip() + "\n"
 
@@ -1080,6 +1089,7 @@ class Orchestrator:
                 "contract_valid": report["contract_integrity"]["valid"],
                 "blocking_audit_issues": len(report["diff_audit"]["blocking_issues"]),
                 "warnings": len(report["diff_audit"]["warnings"]),
+                "same_package_companions": list(report["diff_audit"].get("same_package_companions") or []),
                 "checks": [
                     {
                         "name": c["name"],
@@ -1090,6 +1100,15 @@ class Orchestrator:
                         "duration_sec": c["duration_sec"],
                         "skip_detection": str(c.get("skip_detection") or "not_applicable"),
                         "skipped_count": None if c.get("skipped_count") is None else int(c["skipped_count"]),
+                        **(
+                            {
+                                k: c[k]
+                                for k in ("stdout_log_path", "stderr_log_path")
+                                if c.get(k)
+                            }
+                            if not c["passed"]
+                            else {}
+                        ),
                     }
                     for c in report["checks"]
                 ],
@@ -1250,6 +1269,7 @@ class Orchestrator:
         summary: str,
         feedback: str = "",
         issues: list[str] | None = None,
+        acknowledged_warnings: list[str] | None = None,
         reviewer_model: str | None = None,
     ) -> dict[str, Any]:
         """Record Antigravity's semantic Code Review verdict and drive Completed/Revising/Blocked."""
@@ -1274,12 +1294,14 @@ class Orchestrator:
             )
             repair_round = int(state.get("repair_round", 0))
             max_repairs = int(state.get("max_repair_rounds", 3))
+            ack_list = [w.strip() for w in (acknowledged_warnings or []) if w.strip()]
 
             review_entry = {
                 "round": repair_round,
                 "verdict": verdict_norm,
                 "summary": summary.strip(),
                 "issues": [i.strip() for i in (issues or []) if i.strip()],
+                "acknowledged_warnings": ack_list,
                 "feedback": feedback.strip(),
                 "reviewer_model": eff_reviewer_model,
                 "timestamp": utc_now(),
@@ -1292,6 +1314,8 @@ class Orchestrator:
             atomic_write_json(tdir / "reviews.json", reviews)
 
             state["latest_review"] = review_entry
+            if ack_list and isinstance(state.get("verification_summary"), dict):
+                state["verification_summary"]["acknowledged_warnings"] = ack_list
             state.setdefault("model_history", []).append(
                 make_model_history_entry(
                     round_num=repair_round,
@@ -1312,17 +1336,27 @@ class Orchestrator:
                     "- Issues:\n" + "\n".join(f"  - {item}" for item in review_entry["issues"]) + "\n"
                     if review_entry["issues"]
                     else ""
+                )
+                + (
+                    "- Acknowledged Warnings:\n"
+                    + "\n".join(f"  - {item}" for item in ack_list)
+                    + "\n"
+                    if ack_list
+                    else ""
                 ),
             )
 
             if verdict_norm == "approve":
+                approve_details: dict[str, Any] = {"verdict": "approve", "round": repair_round}
+                if ack_list:
+                    approve_details["acknowledged_warnings"] = ack_list
                 self.store.transition(
                     tid,
                     state,
                     STATE_COMPLETED,
                     event_type="review_approved",
                     message=f"Code Review approved: {review_entry['summary']}",
-                    details={"verdict": "approve", "round": repair_round},
+                    details=approve_details,
                 )
                 return {"ok": True, "next_action": "ready_to_deliver", "task_id": tid, "review": review_entry, "state": state}
 

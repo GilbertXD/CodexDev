@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .contract import verify_contract_integrity
-from .state import atomic_write_json, read_json, utc_now
+from .state import atomic_write_json, atomic_write_text, read_json, utc_now
 from .worktree import inspect_worktree_changes
 
 TEST_FILE_PATTERNS = (
@@ -607,6 +608,152 @@ def detect_prepare_commands(
     return ("auto_detected" if detected else "none", detected)
 
 
+_FAILURE_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"^\s*---\s+FAIL:|"
+    r"^FAIL(?:\s|$)|"
+    r"\bAssertionError\b|"
+    r"^Traceback \(most recent call last\):|"
+    r"\b(?:ERROR|FATAL|PANIC)\s*:|"
+    r"\bpanic:|"
+    r"\bTimed out\b|"
+    r"\btimed out\b|"
+    r"\breturned\s+\d+,\s*expected\s+\d+|"
+    r"\bexit\s+(?:code|status)\s+[1-9]\d*|"
+    r"did not complete successfully|"
+    r"\bno such host\b|"
+    r"\bconnection refused\b|"
+    r"\bpermission denied\b|"
+    r"\bsyntax error\b|"
+    r"\bundefined:\s+\S+|"
+    r"\bcannot find\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_COMPANION_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".go",
+        ".py",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".java",
+        ".kt",
+        ".rb",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+    }
+)
+
+
+def extract_failure_excerpt(text: str, *, max_chars: int = 2400) -> str:
+    """Return a concise failure excerpt preserving early root-cause lines even when teardown logs dominate the tail."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+
+    tail_start = len(text) - max_chars
+    lines = text.splitlines(keepends=True)
+    offset = 0
+    first_match_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if offset < tail_start and _FAILURE_SIGNAL_RE.search(line):
+            first_match_idx = idx
+            break
+        offset += len(line)
+
+    if first_match_idx is None:
+        return text[-max_chars:].strip()
+
+    sep = "\n... [truncated; see full log file] ...\n"
+    head_budget = max(400, (max_chars - len(sep)) // 2)
+    start_idx = max(0, first_match_idx - 5)
+    end_idx = min(len(lines), first_match_idx + 25)
+    window_text = "".join(lines[start_idx:end_idx]).strip()
+    if len(window_text) > head_budget:
+        window_text = window_text[:head_budget].rstrip()
+
+    tail_budget = max(400, max_chars - len(window_text) - len(sep))
+    tail_text = text[-tail_budget:].strip()
+    if window_text and tail_text and window_text in tail_text:
+        return tail_text
+    return f"{window_text}{sep}{tail_text}".strip()
+
+
+def _sanitize_log_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "check").strip()).strip("._")
+    return cleaned or "check"
+
+
+def _persist_check_logs(
+    log_dir: Path,
+    check_name: str,
+    stdout: str,
+    stderr: str,
+) -> tuple[str | None, str | None]:
+    """Persist full stdout/stderr of a failed verification/prepare check for post-mortem inspection."""
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    if not stdout and not stderr:
+        return (None, None)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    slug = _sanitize_log_name(check_name)
+    if stdout:
+        p_out = log_dir / f"{slug}.stdout.log"
+        atomic_write_text(p_out, stdout)
+        stdout_path = str(p_out)
+    if stderr:
+        p_err = log_dir / f"{slug}.stderr.log"
+        atomic_write_text(p_err, stderr)
+        stderr_path = str(p_err)
+    return (stdout_path, stderr_path)
+
+
+def _is_same_package_companion(
+    fpath: str,
+    target_files: list[str],
+    modified_files: set[str],
+) -> bool:
+    """Return True when a modified existing source file is a same-directory companion of a declared target file.
+
+    Strictly requires:
+      - existing file modified (not newly created/untracked or deleted),
+      - non-test, non-config source file with a recognized code extension,
+      - inside a non-root package directory (parent != '.'),
+      - sharing the exact same parent directory and source extension with at least one explicit target file.
+    """
+    if fpath not in modified_files:
+        return False
+    if is_test_file(fpath) or is_config_file(fpath):
+        return False
+    p = Path(fpath)
+    parent = p.parent.as_posix()
+    if parent in ("", "."):
+        return False
+    ext = p.suffix.lower()
+    if ext not in _COMPANION_SOURCE_EXTENSIONS:
+        return False
+
+    for scope in target_files:
+        s = scope.rstrip("/")
+        if not s or s.endswith("*"):
+            continue
+        sp = Path(s)
+        if sp.parent.as_posix() == parent and sp.suffix.lower() == ext:
+            return True
+    return False
+
+
 def run_dependency_prepare(
     *,
     task_dir: Path,
@@ -636,12 +783,17 @@ def run_dependency_prepare(
     passed_count = 0
     failed_count = 0
     generated_allowed_files: list[str] = []
+    prep_log_dir = task_dir / "prepare_logs"
+    if prep_log_dir.exists():
+        shutil.rmtree(prep_log_dir, ignore_errors=True)
 
     for item in commands:
         cmd_str = item["command"]
         name = item["name"]
         t0 = time.monotonic()
         timed_out = False
+        full_stdout = ""
+        full_stderr = ""
         try:
             proc = subprocess.run(
                 cmd_str,
@@ -653,18 +805,22 @@ def run_dependency_prepare(
                 env=stage_env,
             )
             exit_code = int(proc.returncode)
-            stdout_tail = proc.stdout[-4000:] if proc.stdout else ""
-            stderr_tail = proc.stderr[-4000:] if proc.stderr else ""
+            full_stdout = proc.stdout or ""
+            full_stderr = proc.stderr or ""
+            stdout_tail = full_stdout[-4000:] if full_stdout else ""
+            stderr_tail = full_stderr[-4000:] if full_stderr else ""
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             exit_code = -1
-            stdout_tail = (
-                exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            )[-2000:]
-            stderr_tail = f"Prepare command timed out after {eff_timeout}s"
+            full_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stdout_tail = full_stdout[-2000:]
+            full_stderr = f"Prepare command timed out after {eff_timeout}s"
+            stderr_tail = full_stderr
 
         duration = round(time.monotonic() - t0, 2)
         ok = (exit_code == 0) and not timed_out
+        stdout_log_path: str | None = None
+        stderr_log_path: str | None = None
         if ok:
             passed_count += 1
             if name == "go:mod-tidy":
@@ -674,20 +830,29 @@ def run_dependency_prepare(
                 generated_allowed_files.append(f"{sub}/go.sum")
         else:
             failed_count += 1
+            stdout_log_path, stderr_log_path = _persist_check_logs(prep_log_dir, name, full_stdout, full_stderr)
 
-        results.append(
-            {
-                "name": name,
-                "kind": item["kind"],
-                "command": cmd_str,
-                "passed": ok,
-                "exit_code": exit_code,
-                "timed_out": timed_out,
-                "duration_sec": duration,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-            }
-        )
+        entry: dict[str, Any] = {
+            "name": name,
+            "kind": item["kind"],
+            "command": cmd_str,
+            "passed": ok,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "duration_sec": duration,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        }
+        if not ok:
+            if stdout_log_path:
+                entry["stdout_log_path"] = stdout_log_path
+            if stderr_log_path:
+                entry["stderr_log_path"] = stderr_log_path
+            if full_stdout:
+                entry["stdout_excerpt"] = extract_failure_excerpt(full_stdout)
+            if full_stderr:
+                entry["stderr_excerpt"] = extract_failure_excerpt(full_stderr)
+        results.append(entry)
 
     failure_reasons = [
         f"Prepare '{r['name']}' failed (exit={r['exit_code']}): {r['command']}"
@@ -929,6 +1094,8 @@ def audit_diff_integrity(
                 if af not in target_files:
                     target_files.append(af)
     unexpected_files: list[str] = []
+    same_package_companions: list[str] = []
+    modified_set = set(diff_info.get("modified") or [])
     if target_files:
         for fpath in diff_info.get("all_changed_files") or []:
             matched = False
@@ -938,7 +1105,10 @@ def audit_diff_integrity(
                     matched = True
                     break
             if not matched:
-                unexpected_files.append(fpath)
+                if _is_same_package_companion(fpath, target_files, modified_set):
+                    same_package_companions.append(fpath)
+                else:
+                    unexpected_files.append(fpath)
         if unexpected_files:
             warnings.append(
                 {
@@ -953,6 +1123,7 @@ def audit_diff_integrity(
         "blocking_issues": blocking_issues,
         "warnings": warnings,
         "unexpected_files": unexpected_files,
+        "same_package_companions": same_package_companions,
     }
 
 
@@ -997,6 +1168,9 @@ def run_independent_verification(
     test_skip_modes: list[str] = []
     unobservable_commands: list[str] = []
     verify_env = build_stage_env(config, "verify", explicit_env=explicit_env)
+    verify_log_dir = task_dir / "verify_logs"
+    if verify_log_dir.exists():
+        shutil.rmtree(verify_log_dir, ignore_errors=True)
 
     with tempfile.TemporaryDirectory(prefix="codex-dev-verify-") as tmp_report_dir_str:
         tmp_report_dir = Path(tmp_report_dir_str)
@@ -1039,8 +1213,11 @@ def run_independent_verification(
                 timed_out = True
                 exit_code = -1
                 full_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                raw_err = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+                timeout_msg = f"Verification command timed out after {timeout_sec}s"
+                full_stderr = f"{raw_err.rstrip()}\n{timeout_msg}".strip() if raw_err.strip() else timeout_msg
                 stdout_tail = full_stdout[-2000:]
-                stderr_tail = f"Verification command timed out after {timeout_sec}s"
+                stderr_tail = full_stderr[-4000:]
 
             duration = round(time.monotonic() - t0, 2)
             ok = (exit_code == 0) and not timed_out
@@ -1050,14 +1227,26 @@ def run_independent_verification(
                 failed_count += 1
 
             parsed_struct: dict[str, Any] | None = None
+            excerpt_stdout_src = full_stdout
             if adapter == "go_json":
                 parsed_struct = parse_go_test_json(full_stdout)
                 if parsed_struct and parsed_struct.get("display_stdout"):
-                    stdout_tail = str(parsed_struct["display_stdout"])[-4000:]
+                    excerpt_stdout_src = str(parsed_struct["display_stdout"])
+                    stdout_tail = excerpt_stdout_src[-4000:]
             elif adapter == "junit_xml" and isinstance(report_path, Path):
                 parsed_struct = parse_junit_xml(report_path)
             elif adapter == "js_json" and isinstance(report_path, Path):
                 parsed_struct = parse_js_test_json(report_path)
+
+            stdout_log_path: str | None = None
+            stderr_log_path: str | None = None
+            if not ok:
+                stdout_log_path, stderr_log_path = _persist_check_logs(
+                    verify_log_dir,
+                    f"{idx:02d}_{name}",
+                    full_stdout,
+                    full_stderr,
+                )
 
             check_skip_mode: str
             check_skipped_count: int | None
@@ -1115,6 +1304,15 @@ def run_independent_verification(
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
             }
+            if not ok:
+                if stdout_log_path:
+                    check_entry["stdout_log_path"] = stdout_log_path
+                if stderr_log_path:
+                    check_entry["stderr_log_path"] = stderr_log_path
+                if excerpt_stdout_src:
+                    check_entry["stdout_excerpt"] = extract_failure_excerpt(excerpt_stdout_src)
+                if full_stderr:
+                    check_entry["stderr_excerpt"] = extract_failure_excerpt(full_stderr)
             if exec_cmd != cmd_str:
                 check_entry["executed_command"] = exec_cmd
             checks.append(check_entry)

@@ -220,7 +220,10 @@ def build_codex_prompt(
         "invariant guard automatically rejects `partial` and zero-diff exits. Only return "
         "`status: \"blocked\"` if a concrete external prerequisite makes implementation genuinely "
         "impossible, and state that exact blocker.",
-        "5. Run relevant sandbox-safe checks before finishing, and report accurate results.",
+        "5. Run relevant sandbox-safe checks before finishing, and report accurate results. "
+        "Avoid shell `rm -f` / `rm -rf` commands (including inside `trap` cleanup hooks or inline smoke tests) "
+        "because Codex CLI's execution policy rejects `rm -f`-style commands; use `python3` with "
+        "`tempfile.TemporaryDirectory()` or `$GOTMPDIR` for temporary scratch fixtures instead.",
         "6. Return your final response strictly conforming to the provided JSON output schema.",
         sandbox_rule,
         "",
