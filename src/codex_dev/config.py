@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verify_timeout_sec": 300,
     "builder_env": {},
     "builder_add_dirs": [],
+    "builder_isolation": "strict",
     "prepare": {
         "enabled": True,
         "auto_go_mod_tidy": True,

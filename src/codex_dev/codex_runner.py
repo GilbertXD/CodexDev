@@ -13,10 +13,92 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .state import TaskStore, atomic_write_json
+from .config import get_codex_home
+from .state import TaskStore, atomic_write_json, atomic_write_text
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "codex_result.schema.json"
+
+VALID_BUILDER_ISOLATION = {"strict", "inherit"}
+STRICT_DISABLED_FEATURES = (
+    "api_key_model_discovery",
+    "plugins",
+    "apps",
+    "hooks",
+    "skill_search",
+)
+
+
+def _sync_symlink(link_path: Path, target_path: Path) -> None:
+    """Create or refresh a symlink without touching the target file."""
+    if not target_path.exists():
+        if link_path.is_symlink():
+            try:
+                link_path.unlink()
+            except OSError:
+                pass
+        return
+    if link_path.is_symlink():
+        try:
+            if link_path.resolve() == target_path.resolve():
+                return
+            link_path.unlink()
+        except OSError:
+            pass
+    elif link_path.exists():
+        return
+    try:
+        link_path.symlink_to(target_path)
+    except OSError:
+        pass
+
+
+def prepare_isolated_codex_home(
+    codex_dev_home: Path,
+    source_codex_home: Path | None = None,
+) -> Path:
+    """Provision a clean, plugin/skill-free CODEX_HOME under ~/.codex-dev/codex_home.
+
+    Symlinks only auth.json and models_cache.json from the user's real ~/.codex
+    (read-only, never modifying ~/.codex) and writes a minimal config.toml with
+    no third-party plugins, skills, MCP servers, AGENTS.md, or desktop notify hooks.
+    """
+    isolated_dir = (codex_dev_home / "codex_home").resolve()
+    isolated_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(isolated_dir, 0o700)
+    except OSError:
+        pass
+
+    src_home = (source_codex_home or get_codex_home()).resolve()
+    if src_home != isolated_dir:
+        for fname in ("auth.json", "models_cache.json"):
+            _sync_symlink(isolated_dir / fname, src_home / fname)
+
+    minimal_toml = (
+        "# Managed by codex-dev (strict Builder isolation). Do not place personal plugins/skills here.\n"
+        'approval_policy = "never"\n'
+        "check_for_update_on_startup = false\n"
+        "notify = []\n"
+        "\n"
+        "[features]\n"
+        "api_key_model_discovery = false\n"
+        "plugins = false\n"
+        "apps = false\n"
+        "hooks = false\n"
+        "skill_search = false\n"
+        "memories = false\n"
+        "chronicle = false\n"
+    )
+    cfg_path = isolated_dir / "config.toml"
+    try:
+        existing = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else None
+    except OSError:
+        existing = None
+    if existing != minimal_toml:
+        atomic_write_text(cfg_path, minimal_toml)
+
+    return isolated_dir
 
 
 @dataclass
@@ -244,6 +326,7 @@ def run_codex_exec(
     idle_timeout_sec: int = 0,
     builder_env: dict[str, str] | None = None,
     builder_add_dirs: list[str] | None = None,
+    builder_isolation: str = "strict",
     on_token_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> CodexRunOutcome:
     """Execute `codex exec` non-interactively, streaming JSONL events into the task store."""
@@ -282,6 +365,11 @@ def run_codex_exec(
                 if resolved_d not in add_dirs:
                     add_dirs.append(resolved_d)
 
+    eff_isolation = builder_isolation if builder_isolation in VALID_BUILDER_ISOLATION else "strict"
+    isolated_codex_home: Path | None = None
+    if eff_isolation == "strict":
+        isolated_codex_home = prepare_isolated_codex_home(store.home_dir)
+
     # Support either direct executable file path (possibly with spaces) or multi-token command (for mock testing)
     if Path(codex_binary).is_file():
         bin_tokens = [codex_binary]
@@ -302,13 +390,17 @@ def run_codex_exec(
         "-o",
         str(result_file_path),
         "--ephemeral",
-        "--disable",
-        "api_key_model_discovery",
         "-c",
         'approval_policy="never"',
         "-c",
         "check_for_update_on_startup=false",
     ]
+    if eff_isolation == "strict":
+        for feat in STRICT_DISABLED_FEATURES:
+            cmd.extend(["--disable", feat])
+        cmd.extend(["-c", "notify=[]"])
+    else:
+        cmd.extend(["--disable", "api_key_model_discovery"])
     for extra_dir in add_dirs:
         cmd.extend(["--add-dir", extra_dir])
     for env_k, env_v in injected_env.items():
@@ -318,6 +410,8 @@ def run_codex_exec(
     cmd.append("-")
 
     proc_env = {**os.environ, **injected_env}
+    if isolated_codex_home is not None:
+        proc_env["CODEX_HOME"] = str(isolated_codex_home)
 
     start_ts = time.monotonic()
     last_activity_ts = start_ts
@@ -346,6 +440,8 @@ def run_codex_exec(
         details={
             "model": model,
             "sandbox": sandbox_mode,
+            "builder_isolation": eff_isolation,
+            "isolated_codex_home": str(isolated_codex_home) if isolated_codex_home else None,
             "round": repair_round,
             "attempt": attempt,
             "timeout_sec": timeout_sec,

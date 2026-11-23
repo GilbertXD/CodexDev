@@ -460,6 +460,7 @@ class Orchestrator:
                 idle_timeout_sec=eff_idle_timeout,
                 builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
                 builder_add_dirs=cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
+                builder_isolation=str(cfg.get("builder_isolation") or "strict"),
                 on_token_usage=_live_usage_cb,
             )
 

@@ -58,6 +58,7 @@ def main() -> int:
                 "configs": args.config,
                 "env_gocache": os.environ.get("GOCACHE"),
                 "env_gotmpdir": os.environ.get("GOTMPDIR"),
+                "env_codex_home": os.environ.get("CODEX_HOME"),
             }
         )
         rec_path.write_text(json.dumps(history, indent=2), encoding="utf-8")

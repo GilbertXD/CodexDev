@@ -873,6 +873,69 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertLess(outcome["duration_sec"], 6.0)
         self.assertIn("benign codex model-refresh timeout", outcome["stderr_tail"])
 
+    def test_20_builder_strict_isolation_codex_home_and_flags(self) -> None:
+        fake_user_codex = self.tmp_path / "user_codex_home"
+        fake_user_codex.mkdir(parents=True, exist_ok=True)
+        (fake_user_codex / "auth.json").write_text('{"token":"fake-auth"}\n', encoding="utf-8")
+        (fake_user_codex / "models_cache.json").write_text('{"models":[]}\n', encoding="utf-8")
+        (fake_user_codex / "AGENTS.md").write_text("# Personal instructions\n", encoding="utf-8")
+        (fake_user_codex / "skills").mkdir(exist_ok=True)
+        (fake_user_codex / "skills" / "custom.md").write_text("personal skill\n", encoding="utf-8")
+        orig_codex_home = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(fake_user_codex)
+        try:
+            repo = _create_python_repo(self.tmp_path / "iso_repo")
+            rec_file = self.tmp_path / "iso_record.json"
+            os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
+
+            # 1) Default strict isolation: isolated CODEX_HOME + disabled plugins/apps/hooks/skill_search
+            tid = self.orch.init_task(name="Strict isolation test", repo_path=repo)["task"]["task_id"]
+            self.orch.save_plan(tid, PLAN_PY)
+            res = self.orch.execute_round(tid)
+            self.assertTrue(res["ok"])
+
+            records = json.loads(rec_file.read_text(encoding="utf-8"))
+            self.assertEqual(len(records), 1)
+            rec = records[0]
+            expected_iso = str((self.orch.home_dir / "codex_home").resolve())
+            self.assertEqual(rec["env_codex_home"], expected_iso)
+            self.assertNotEqual(rec["env_codex_home"], str(fake_user_codex.resolve()))
+            for feat in ("api_key_model_discovery", "plugins", "apps", "hooks", "skill_search"):
+                self.assertIn(feat, rec["disabled"])
+            self.assertIn("notify=[]", rec["configs"])
+
+            iso_dir = Path(expected_iso)
+            self.assertTrue((iso_dir / "auth.json").is_symlink())
+            self.assertTrue((iso_dir / "models_cache.json").is_symlink())
+            self.assertEqual((iso_dir / "auth.json").resolve(), (fake_user_codex / "auth.json").resolve())
+            self.assertFalse((iso_dir / "AGENTS.md").exists())
+            self.assertFalse((iso_dir / "skills").exists())
+            cfg_toml = (iso_dir / "config.toml").read_text(encoding="utf-8")
+            self.assertIn("plugins = false", cfg_toml)
+            self.assertIn("notify = []", cfg_toml)
+            # User's original ~/.codex remains completely untouched
+            self.assertTrue((fake_user_codex / "AGENTS.md").is_file())
+            self.assertTrue((fake_user_codex / "skills" / "custom.md").is_file())
+
+            # 2) Inherit mode via repo override preserves user CODEX_HOME and does not disable plugins
+            (repo / ".codex-dev.local.json").write_text(
+                json.dumps({"builder_isolation": "inherit"}), encoding="utf-8"
+            )
+            tid2 = self.orch.init_task(name="Inherit isolation test", repo_path=repo)["task"]["task_id"]
+            self.orch.save_plan(tid2, PLAN_PY)
+            res2 = self.orch.execute_round(tid2)
+            self.assertTrue(res2["ok"])
+            records = json.loads(rec_file.read_text(encoding="utf-8"))
+            rec2 = records[1]
+            self.assertEqual(rec2["env_codex_home"], str(fake_user_codex))
+            self.assertNotIn("plugins", rec2["disabled"])
+            self.assertIn("api_key_model_discovery", rec2["disabled"])
+        finally:
+            if orig_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = orig_codex_home
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
