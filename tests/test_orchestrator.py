@@ -1544,6 +1544,156 @@ Add standalone documents with migration, API, and integration tests.
         self.assertIn("Complete the FULL implementation across all Target Files", net_prompt)
         self.assertIn("ready_for_verify", net_prompt)
 
+    def test_30_structured_skip_detection_tri_state_observability_and_changed_test_guard(self) -> None:
+        from codex_dev.verifier import (
+            find_skipped_changed_tests,
+            instrument_verify_command,
+            parse_go_test_json,
+            parse_js_test_json,
+            parse_junit_xml,
+        )
+
+        # 1) Command instrumentation for Go, pytest, Jest, Vitest, and safe opt-out on shell chains / non-tests
+        rdir = self.tmp_path / "struct_reports"
+        rdir.mkdir(parents=True)
+        go_inst = instrument_verify_command("go test -count=1 -race ./...", rdir, 1)
+        self.assertEqual(go_inst["adapter"], "go_json")
+        self.assertEqual(go_inst["executed_command"], "go test -json -count=1 -race ./...")
+        self.assertTrue(go_inst["is_test_command"])
+
+        go_compile = instrument_verify_command("go test -c ./...", rdir, 1)
+        self.assertIsNone(go_compile["adapter"])
+
+        py_inst = instrument_verify_command("python3 -m pytest -q", rdir, 2)
+        self.assertEqual(py_inst["adapter"], "junit_xml")
+        self.assertIn("--junitxml=", py_inst["executed_command"])
+
+        jest_inst = instrument_verify_command("npx jest --no-cache", rdir, 3)
+        self.assertEqual(jest_inst["adapter"], "js_json")
+        self.assertIn("--json --outputFile=", jest_inst["executed_command"])
+
+        vitest_inst = instrument_verify_command("npx vitest run", rdir, 4)
+        self.assertEqual(vitest_inst["adapter"], "js_json")
+        self.assertIn("--reporter=json --outputFile=", vitest_inst["executed_command"])
+
+        chain_inst = instrument_verify_command("go test ./... && echo done", rdir, 5)
+        self.assertIsNone(chain_inst["adapter"])
+        self.assertTrue(chain_inst["is_test_command"])
+
+        vet_inst = instrument_verify_command("go vet ./...", rdir, 6)
+        self.assertIsNone(vet_inst["adapter"])
+        self.assertFalse(vet_inst["is_test_command"])
+
+        # 2) Structured parsers: Go -json (catches skips even without -v), JUnit XML, Jest/Vitest JSON
+        go_json_out = "\n".join(
+            [
+                json.dumps({"Action": "run", "Package": "demo/pkg", "Test": "TestFast"}),
+                json.dumps({"Action": "pass", "Package": "demo/pkg", "Test": "TestFast"}),
+                json.dumps({"Action": "run", "Package": "demo/pkg", "Test": "TestLiveDB"}),
+                json.dumps({"Action": "output", "Package": "demo/pkg", "Test": "TestLiveDB", "Output": "    db_test.go:12: TEST_DATABASE_URL is unset\n"}),
+                json.dumps({"Action": "skip", "Package": "demo/pkg", "Test": "TestLiveDB"}),
+                json.dumps({"Action": "output", "Package": "demo/pkg", "Output": "ok  \tdemo/pkg\t0.01s\n"}),
+                json.dumps({"Action": "pass", "Package": "demo/pkg"}),
+            ]
+        )
+        go_parsed = parse_go_test_json(go_json_out)
+        self.assertIsNotNone(go_parsed)
+        assert go_parsed is not None
+        self.assertEqual(go_parsed["skip_detection"], "structured")
+        self.assertEqual(go_parsed["skipped_count"], 1)
+        self.assertEqual(go_parsed["skipped_tests"], ["TestLiveDB"])
+        self.assertIn("TEST_DATABASE_URL is unset", go_parsed["skipped_test_details"][0]["reason"])
+        self.assertEqual(go_parsed["executed_tests"], 2)
+
+        junit_file = rdir / "sample.xml"
+        junit_file.write_text(
+            '<testsuite tests="2" skipped="1">'
+            '<testcase classname="tests.test_api" name="test_ok"/>'
+            '<testcase classname="tests.test_api" name="test_pg"><skipped message="no postgres"/></testcase>'
+            "</testsuite>\n",
+            encoding="utf-8",
+        )
+        junit_parsed = parse_junit_xml(junit_file)
+        assert junit_parsed is not None
+        self.assertEqual(junit_parsed["skipped_count"], 1)
+        self.assertEqual(junit_parsed["skipped_tests"], ["tests.test_api::test_pg"])
+        self.assertEqual(junit_parsed["skipped_test_details"][0]["reason"], "no postgres")
+
+        js_file = rdir / "jest.json"
+        js_file.write_text(
+            json.dumps(
+                {
+                    "testResults": [
+                        {
+                            "name": "app.test.ts",
+                            "assertionResults": [
+                                {"fullName": "app works", "status": "passed"},
+                                {"fullName": "app needs redis", "status": "pending"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        js_parsed = parse_js_test_json(js_file)
+        assert js_parsed is not None
+        self.assertEqual(js_parsed["skipped_count"], 1)
+        self.assertEqual(js_parsed["skipped_tests"], ["app needs redis"])
+
+        # 3) Tri-state observability: opaque test command reports unobservable + skipped_tests_total=None (NOT fake 0)
+        repo = _create_python_repo(self.tmp_path / "tri_state_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Opaque test skip observability", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        self.orch.execute_round(tid)
+        ver_unobs = self.orch.verify_task(
+            tid,
+            verify_commands=["make test || true && python3 -c \"print('opaque ok')\""],
+        )
+        self.assertTrue(ver_unobs["ok"])
+        rep_u = ver_unobs["report"]
+        self.assertEqual(rep_u["skip_detection"], "unobservable")
+        self.assertIsNone(rep_u["skipped_tests_total"])
+        self.assertIsNone(ver_unobs["state"]["verification_summary"]["skipped_tests_total"])
+        self.assertEqual(ver_unobs["state"]["verification_summary"]["skip_detection"], "unobservable")
+        warn_codes = [w["code"] for w in rep_u["diff_audit"]["warnings"]]
+        self.assertIn("unobservable_skips", warn_codes)
+
+        # 4) Changed-test skip guard: skipping a newly modified/added test BLOCKS verification,
+        #    while skipping an untouched test only emits a non-blocking warning.
+        wt_sample = self.tmp_path / "changed_guard_wt"
+        wt_sample.mkdir()
+        (wt_sample / "doc_test.go").write_text(
+            "package doc\nimport \"testing\"\nfunc TestNewDocFeature(t *testing.T) {}\n",
+            encoding="utf-8",
+        )
+        matched_changed, _ = find_skipped_changed_tests(wt_sample, ["doc_test.go"], ["TestNewDocFeature/sub", "TestOtherUntouched"])
+        self.assertEqual(matched_changed, ["TestNewDocFeature/sub"])
+
+        # End-to-end changed-test skip blocking on real repo
+        repo_guard = _create_python_repo(self.tmp_path / "changed_skip_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid_g = self.orch.init_task(name="Changed test skipped guard", repo_path=repo_guard)["task"]["task_id"]
+        self.orch.save_plan(tid_g, PLAN_PY)
+        self.orch.execute_round(tid_g)
+        wt_g = Path(self.orch.store.load_task_meta(tid_g)["worktree_path"])
+        # Add a new test file in worktree that skips when MISSING_ENV is unset (without literal @unittest.skip weakening)
+        (wt_g / "test_new_feature.py").write_text(
+            "import os, unittest\n\n"
+            "class TestNewFeature(unittest.TestCase):\n"
+            "    def test_requires_env(self):\n"
+            "        if not os.environ.get('REQUIRED_ENV_FOR_NEW_TEST'):\n"
+            "            raise unittest.SkipTest('missing env')\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        ver_g = self.orch.verify_task(tid_g, verify_commands=["python3 -m unittest discover -v"])
+        self.assertFalse(ver_g["ok"])
+        self.assertEqual(ver_g["next_action"], "repair_available")
+        block_codes = [b["code"] for b in ver_g["report"]["diff_audit"]["blocking_issues"]]
+        self.assertIn("changed_tests_skipped", block_codes)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

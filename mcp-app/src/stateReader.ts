@@ -291,8 +291,19 @@ export function formatPlainTextSummary(snapshot: MonitorSnapshot): string {
   ];
 
   if (ver && typeof ver.commands_total === "number") {
-    const skipped = Number(ver.skipped_tests_total ?? 0);
-    const skipSuffix = skipped > 0 ? `, ${skipped} skipped` : "";
+    const skipMode = typeof ver.skip_detection === "string" ? ver.skip_detection : "";
+    const rawSkipped = ver.skipped_tests_total;
+    let skipSuffix = "";
+    if (skipMode === "unobservable" || rawSkipped === null) {
+      skipSuffix = ", skips unobservable";
+    } else {
+      const skipped = Number(rawSkipped ?? 0);
+      if (skipped > 0) {
+        skipSuffix = `, ${skipped} skipped${skipMode === "partial" ? " (partial)" : ""}`;
+      } else if (skipMode === "partial") {
+        skipSuffix = ", skips partially observable";
+      }
+    }
     lines.push(
       `Verification: ${ver.passed ? "PASSED" : "FAILED"} (${ver.commands_passed}/${ver.commands_total} checks${skipSuffix})`,
     );

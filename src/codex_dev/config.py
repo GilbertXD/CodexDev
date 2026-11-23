@@ -52,6 +52,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commands": [],
         "env": {},
         "no_cache": True,
+        "structured_reporting": True,
+        "block_on_changed_test_skip": True,
     },
     "repo_overrides": {},
     "model_policy": {

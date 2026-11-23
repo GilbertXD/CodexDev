@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +106,382 @@ def detect_skipped_tests(stdout: str, stderr: str = "") -> dict[str, Any]:
     )
     total = max(total, len(names))
     return {"skipped_count": total, "skipped_tests": names[:25]}
+
+
+_NON_TEST_CMD_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*("
+    r"go\s+(?:vet|build|fmt|mod)\b|"
+    r"make\s+(?:vet|build|lint|fmt|tidy|docker-\w+)\b|"
+    r"docker\s+compose\b|"
+    r"(?:npx|pnpm|yarn|bunx)?\s*(?:tsc|eslint|biome|prettier)\b|"
+    r"npm\s+run\s+(?:build|lint|typecheck|format)\b|"
+    r"(?:python3?\s+-m\s+)?(?:ruff|flake8|mypy|black|isort)\b|"
+    r"cargo\s+(?:check|clippy|build|fmt)\b"
+    r")"
+)
+_TEST_CMD_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"go\s+test\b|"
+    r"(?:python3?\s+-m\s+)?(?:pytest|unittest)\b|"
+    r"(?:npx|pnpm|yarn|bunx)?\s*(?:jest|vitest)\b|"
+    r"node\s+--test\b|"
+    r"cargo\s+test\b|"
+    r"npm\s+(?:test|run\s+test\b)|"
+    r"(?:pnpm|yarn)\s+(?:test|run\s+test\b)|"
+    r"make\s+test(?:[-_]\w+)?\b|"
+    r"(?:mvn|gradle|./gradlew)\s+test\b|"
+    r"ctest\b"
+    r")"
+)
+_OBSERVABLE_TEST_SUMMARY_RES = (
+    re.compile(r"^\s*Ran\s+\d+\s+tests?\s+in\b", re.MULTILINE),
+    re.compile(r"^test result:\s+(?:ok|FAILED)\.", re.MULTILINE),
+    re.compile(r"^#\s+tests\s+\d+\s*$", re.MULTILINE),
+    re.compile(r"^\s*Tests:\s+.*\btotal\b", re.MULTILINE),
+    re.compile(r"(?:^=+[^\n]*?\b(?:passed|failed|skipped)\b[^\n]*?=+\s*$)|(?:^\s*\d+\s+(?:passed|failed|skipped)\b[^\n]*\bin\s+[\d.]+s)", re.MULTILINE),
+    re.compile(r"^\s*---\s+(?:PASS|FAIL|SKIP):\s+\S+", re.MULTILINE),
+)
+
+
+def _has_shell_chaining(cmd: str) -> bool:
+    """Return True if shell chaining/piping operators appear outside quotes."""
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch in (";", "|", "\n"):
+                return True
+            if ch == "&" and i + 1 < n and cmd[i + 1] == "&":
+                return True
+        i += 1
+    return False
+
+
+def _is_test_command(cmd: str, kind: str = "custom") -> bool:
+    s = cmd.strip()
+    if kind in ("lint", "build", "typecheck", "prepare"):
+        return False
+    if _NON_TEST_CMD_RE.match(s):
+        return False
+    if kind == "test":
+        return True
+    return bool(_TEST_CMD_RE.search(s))
+
+
+def instrument_verify_command(
+    cmd: str,
+    report_dir: Path,
+    check_idx: int,
+    *,
+    kind: str = "custom",
+    structured_reporting: bool = True,
+) -> dict[str, Any]:
+    """Optionally attach machine-readable structured output flags for supported test runners.
+
+    Preserves command semantics without altering the original display command.
+    """
+    s = cmd.strip()
+    is_test = _is_test_command(s, kind=kind)
+    if not structured_reporting or not s or _has_shell_chaining(s):
+        return {
+            "executed_command": s,
+            "adapter": None,
+            "report_path": None,
+            "is_test_command": is_test,
+        }
+
+    # 1) Go test: inject -json unless compile-only (-c / -o)
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*go\s+test\b", s):
+        if not re.search(r"(?:^|\s)-(?:c|o)(?:=|\s|$)", s):
+            if re.search(r"(?:^|\s)-json\b", s):
+                return {
+                    "executed_command": s,
+                    "adapter": "go_json",
+                    "report_path": None,
+                    "is_test_command": True,
+                }
+            return {
+                "executed_command": re.sub(r"(\bgo\s+test\b)", r"\1 -json", s, count=1),
+                "adapter": "go_json",
+                "report_path": None,
+                "is_test_command": True,
+            }
+
+    # 2) Pytest: inject --junitxml=<tmp>/junit_<idx>.xml
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:python3?\s+-m\s+)?pytest\b", s):
+        if not re.search(r"(?:^|\s)--junitxml(?:=|\s)", s):
+            rpath = report_dir / f"junit_{check_idx}.xml"
+            return {
+                "executed_command": f"{s} --junitxml={shlex.quote(str(rpath))}",
+                "adapter": "junit_xml",
+                "report_path": rpath,
+                "is_test_command": True,
+            }
+
+    # 3) Jest: inject --json --outputFile=<tmp>/jest_<idx>.json
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:npx|pnpm|yarn|bunx)\s+)?jest\b", s):
+        if not re.search(r"(?:^|\s)(?:--json|--outputFile)(?:=|\s|$)", s):
+            rpath = report_dir / f"jest_{check_idx}.json"
+            return {
+                "executed_command": f"{s} --json --outputFile={shlex.quote(str(rpath))}",
+                "adapter": "js_json",
+                "report_path": rpath,
+                "is_test_command": True,
+            }
+
+    # 4) Vitest: inject --reporter=json --outputFile=<tmp>/vitest_<idx>.json
+    if re.match(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:npx|pnpm|yarn|bunx)\s+)?vitest\s+run\b", s):
+        if not re.search(r"(?:^|\s)(?:--reporter|--outputFile)(?:=|\s|$)", s):
+            rpath = report_dir / f"vitest_{check_idx}.json"
+            return {
+                "executed_command": f"{s} --reporter=json --outputFile={shlex.quote(str(rpath))}",
+                "adapter": "js_json",
+                "report_path": rpath,
+                "is_test_command": True,
+            }
+
+    return {
+        "executed_command": s,
+        "adapter": None,
+        "report_path": None,
+        "is_test_command": is_test,
+    }
+
+
+def parse_go_test_json(stdout: str) -> dict[str, Any] | None:
+    """Parse `go test -json` NDJSON output for exact per-test skip counts, reasons, and readable logs."""
+    if not stdout or not stdout.strip():
+        return None
+    events_parsed = 0
+    last_output: dict[tuple[str, str], str] = {}
+    executed: set[tuple[str, str]] = set()
+    skipped_details: list[dict[str, str]] = []
+    skipped_seen: set[tuple[str, str]] = set()
+    display_lines: list[str] = []
+
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not line.startswith("{"):
+            display_lines.append(raw_line)
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            display_lines.append(raw_line)
+            continue
+        if not isinstance(ev, dict) or "Action" not in ev:
+            display_lines.append(raw_line)
+            continue
+        events_parsed += 1
+        action = str(ev.get("Action") or "")
+        pkg = str(ev.get("Package") or "")
+        test_name = str(ev.get("Test") or "")
+        output = str(ev.get("Output") or "")
+
+        if action == "output" and output:
+            cleaned = output.strip()
+            if test_name:
+                if cleaned and not cleaned.startswith(("=== RUN", "=== PAUSE", "=== CONT", "--- SKIP", "--- PASS", "--- FAIL")):
+                    last_output[(pkg, test_name)] = cleaned[:240]
+                if cleaned.startswith(("--- FAIL:", "--- SKIP:", "FAIL")) or "FAIL" in cleaned:
+                    display_lines.append(output.rstrip("\n"))
+            else:
+                # Package-level summary line (ok / ? / FAIL)
+                display_lines.append(output.rstrip("\n"))
+        elif test_name and action in ("pass", "fail", "skip"):
+            executed.add((pkg, test_name))
+            if action == "skip" and (pkg, test_name) not in skipped_seen:
+                skipped_seen.add((pkg, test_name))
+                skipped_details.append(
+                    {
+                        "name": test_name,
+                        "package": pkg,
+                        "reason": last_output.get((pkg, test_name), ""),
+                    }
+                )
+
+    if events_parsed == 0:
+        return None
+
+    dedup_names: list[str] = []
+    seen_names: set[str] = set()
+    for item in skipped_details:
+        if item["name"] not in seen_names:
+            seen_names.add(item["name"])
+            dedup_names.append(item["name"])
+
+    return {
+        "skip_detection": "structured",
+        "skipped_count": len(skipped_details),
+        "skipped_tests": dedup_names[:25],
+        "skipped_test_details": skipped_details[:25],
+        "executed_tests": len(executed),
+        "display_stdout": "\n".join(display_lines).strip(),
+    }
+
+
+def parse_junit_xml(xml_path: Path) -> dict[str, Any] | None:
+    """Parse JUnit XML test report (e.g. pytest --junitxml) for exact skipped test counts and reasons."""
+    if not xml_path.is_file():
+        return None
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return None
+    root = tree.getroot()
+    executed = 0
+    skipped_details: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for tc in root.iter("testcase"):
+        executed += 1
+        cls = str(tc.attrib.get("classname") or "").strip()
+        name = str(tc.attrib.get("name") or "").strip()
+        full_name = f"{cls}::{name}" if cls and name else (name or cls)
+        skip_el = tc.find("skipped")
+        if skip_el is not None:
+            reason = str(skip_el.attrib.get("message") or (skip_el.text or "")).strip()[:240]
+            if full_name and full_name not in seen:
+                seen.add(full_name)
+                skipped_details.append({"name": full_name, "package": cls, "reason": reason})
+
+    return {
+        "skip_detection": "structured",
+        "skipped_count": len(skipped_details),
+        "skipped_tests": [d["name"] for d in skipped_details][:25],
+        "skipped_test_details": skipped_details[:25],
+        "executed_tests": executed,
+    }
+
+
+def parse_js_test_json(json_path: Path) -> dict[str, Any] | None:
+    """Parse Jest / Vitest JSON report file for exact skipped/pending test counts and names."""
+    if not json_path.is_file():
+        return None
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("testResults"), list):
+        return None
+
+    executed = 0
+    skipped_details: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for suite in data["testResults"]:
+        if not isinstance(suite, dict):
+            continue
+        suite_name = str(suite.get("name") or "")
+        assertions = suite.get("assertionResults") or []
+        if not isinstance(assertions, list):
+            continue
+        for item in assertions:
+            if not isinstance(item, dict):
+                continue
+            executed += 1
+            st = str(item.get("status") or "").lower()
+            if st in ("pending", "skipped", "todo"):
+                tname = str(item.get("fullName") or item.get("title") or "").strip()
+                if tname and tname not in seen:
+                    seen.add(tname)
+                    skipped_details.append({"name": tname, "package": suite_name, "reason": st})
+
+    return {
+        "skip_detection": "structured",
+        "skipped_count": len(skipped_details),
+        "skipped_tests": [d["name"] for d in skipped_details][:25],
+        "skipped_test_details": skipped_details[:25],
+        "executed_tests": executed,
+    }
+
+
+def _has_observable_test_summary(stdout: str, stderr: str = "") -> bool:
+    combined = "\n".join(part for part in (stdout or "", stderr or "") if part)
+    if not combined.strip():
+        return False
+    return any(pat.search(combined) for pat in _OBSERVABLE_TEST_SUMMARY_RES)
+
+
+def _extract_test_names_from_file(path: Path) -> list[str]:
+    """Extract test function names declared in a changed/added test file."""
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    suffix = path.suffix.lower()
+    if suffix == ".go":
+        return list(dict.fromkeys(re.findall(r"^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(", text, re.MULTILINE)))
+    if suffix == ".py":
+        return list(dict.fromkeys(re.findall(r"^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(", text, re.MULTILINE)))
+    if suffix == ".rs":
+        return list(
+            dict.fromkeys(
+                re.findall(r"#\[(?:[\w:]+::)?test(?:\([^\]]*\))?\]\s*(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(", text)
+            )
+        )
+    return []
+
+
+def _normalize_skipped_test_base_name(raw_name: str) -> str:
+    """Normalize Go subtests, pytest nodeids, unittest labels, and Rust module paths to base test name."""
+    s = raw_name.strip()
+    if " (" in s:
+        s = s.split(" (", 1)[0].strip()
+    if "::" in s:
+        s = s.rsplit("::", 1)[-1].strip()
+    if "/" in s:
+        s = s.split("/", 1)[0].strip()
+    if "[" in s:
+        s = s.split("[", 1)[0].strip()
+    return s
+
+
+def find_skipped_changed_tests(
+    worktree_path: Path,
+    changed_files: list[str],
+    skipped_tests: list[str],
+) -> tuple[list[str], list[str]]:
+    """Return (matched_skipped_test_names, changed_test_files) when changed/added tests were skipped."""
+    if not changed_files or not skipped_tests:
+        return ([], [])
+    changed_test_files = [f for f in changed_files if is_test_file(f) and (worktree_path / f).is_file()]
+    if not changed_test_files:
+        return ([], [])
+
+    declared_in_diff: set[str] = set()
+    for rel in changed_test_files:
+        declared_in_diff.update(_extract_test_names_from_file(worktree_path / rel))
+    if not declared_in_diff:
+        return ([], changed_test_files)
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for skipped in skipped_tests:
+        base = _normalize_skipped_test_base_name(skipped)
+        if base in declared_in_diff and skipped not in seen:
+            seen.add(skipped)
+            matched.append(skipped)
+    return (matched, changed_test_files)
 
 
 def is_test_file(path: str) -> bool:
@@ -602,60 +981,127 @@ def run_independent_verification(
         explicit_commands=explicit_commands,
     )
 
+    cfg_verify = config.get("verify") or {}
+    structured_reporting = bool(cfg_verify.get("structured_reporting", True)) if isinstance(cfg_verify, dict) else True
+    block_on_changed_test_skip = (
+        bool(cfg_verify.get("block_on_changed_test_skip", True)) if isinstance(cfg_verify, dict) else True
+    )
+
     checks: list[dict[str, Any]] = []
     passed_count = 0
     failed_count = 0
-    skipped_tests_total = 0
+    observed_skipped_total = 0
     all_skipped_tests: list[str] = []
+    all_skipped_details: list[dict[str, str]] = []
     seen_skipped_tests: set[str] = set()
+    test_skip_modes: list[str] = []
+    unobservable_commands: list[str] = []
     verify_env = build_stage_env(config, "verify", explicit_env=explicit_env)
 
-    for item in commands:
-        cmd_str = item["command"]
-        name = item["name"]
-        kind = item["kind"]
-        t0 = time.monotonic()
-        timed_out = False
-        full_stdout = ""
-        full_stderr = ""
-        try:
-            proc = subprocess.run(
+    with tempfile.TemporaryDirectory(prefix="codex-dev-verify-") as tmp_report_dir_str:
+        tmp_report_dir = Path(tmp_report_dir_str)
+        for idx, item in enumerate(commands, 1):
+            cmd_str = item["command"]
+            name = item["name"]
+            kind = item["kind"]
+            inst = instrument_verify_command(
                 cmd_str,
-                cwd=str(worktree_path),
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                env=verify_env,
+                tmp_report_dir,
+                idx,
+                kind=kind,
+                structured_reporting=structured_reporting,
             )
-            exit_code = int(proc.returncode)
-            full_stdout = proc.stdout or ""
-            full_stderr = proc.stderr or ""
-            stdout_tail = full_stdout[-4000:] if full_stdout else ""
-            stderr_tail = full_stderr[-4000:] if full_stderr else ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            exit_code = -1
-            full_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stdout_tail = full_stdout[-2000:]
-            stderr_tail = f"Verification command timed out after {timeout_sec}s"
+            exec_cmd = inst["executed_command"]
+            adapter = inst["adapter"]
+            report_path = inst["report_path"]
+            is_test_cmd = bool(inst["is_test_command"])
 
-        duration = round(time.monotonic() - t0, 2)
-        ok = (exit_code == 0) and not timed_out
-        if ok:
-            passed_count += 1
-        else:
-            failed_count += 1
+            t0 = time.monotonic()
+            timed_out = False
+            full_stdout = ""
+            full_stderr = ""
+            try:
+                proc = subprocess.run(
+                    exec_cmd,
+                    cwd=str(worktree_path),
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    env=verify_env,
+                )
+                exit_code = int(proc.returncode)
+                full_stdout = proc.stdout or ""
+                full_stderr = proc.stderr or ""
+                stdout_tail = full_stdout[-4000:] if full_stdout else ""
+                stderr_tail = full_stderr[-4000:] if full_stderr else ""
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                exit_code = -1
+                full_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                stdout_tail = full_stdout[-2000:]
+                stderr_tail = f"Verification command timed out after {timeout_sec}s"
 
-        skip_info = detect_skipped_tests(full_stdout, full_stderr)
-        skipped_tests_total += int(skip_info["skipped_count"])
-        for tname in skip_info["skipped_tests"]:
-            if tname not in seen_skipped_tests:
-                seen_skipped_tests.add(tname)
-                all_skipped_tests.append(tname)
+            duration = round(time.monotonic() - t0, 2)
+            ok = (exit_code == 0) and not timed_out
+            if ok:
+                passed_count += 1
+            else:
+                failed_count += 1
 
-        checks.append(
-            {
+            parsed_struct: dict[str, Any] | None = None
+            if adapter == "go_json":
+                parsed_struct = parse_go_test_json(full_stdout)
+                if parsed_struct and parsed_struct.get("display_stdout"):
+                    stdout_tail = str(parsed_struct["display_stdout"])[-4000:]
+            elif adapter == "junit_xml" and isinstance(report_path, Path):
+                parsed_struct = parse_junit_xml(report_path)
+            elif adapter == "js_json" and isinstance(report_path, Path):
+                parsed_struct = parse_js_test_json(report_path)
+
+            check_skip_mode: str
+            check_skipped_count: int | None
+            check_skipped_names: list[str]
+            check_skipped_details: list[dict[str, str]]
+
+            if parsed_struct is not None:
+                check_skip_mode = "structured"
+                check_skipped_count = int(parsed_struct["skipped_count"])
+                check_skipped_names = list(parsed_struct["skipped_tests"])
+                check_skipped_details = list(parsed_struct.get("skipped_test_details") or [])
+            else:
+                heur = detect_skipped_tests(full_stdout, full_stderr)
+                h_count = int(heur["skipped_count"])
+                h_names = list(heur["skipped_tests"])
+                if h_count > 0 or _has_observable_test_summary(full_stdout, full_stderr):
+                    check_skip_mode = "heuristic"
+                    check_skipped_count = h_count
+                    check_skipped_names = h_names
+                    check_skipped_details = [{"name": n, "package": "", "reason": ""} for n in h_names]
+                elif is_test_cmd:
+                    check_skip_mode = "unobservable"
+                    check_skipped_count = None
+                    check_skipped_names = []
+                    check_skipped_details = []
+                    unobservable_commands.append(cmd_str)
+                else:
+                    check_skip_mode = "not_applicable"
+                    check_skipped_count = 0
+                    check_skipped_names = []
+                    check_skipped_details = []
+
+            if check_skip_mode != "not_applicable":
+                test_skip_modes.append(check_skip_mode)
+            if isinstance(check_skipped_count, int):
+                observed_skipped_total += check_skipped_count
+            for detail_item in check_skipped_details:
+                tname = detail_item["name"]
+                if tname not in seen_skipped_tests:
+                    seen_skipped_tests.add(tname)
+                    all_skipped_tests.append(tname)
+                    all_skipped_details.append(detail_item)
+
+            check_entry: dict[str, Any] = {
                 "name": name,
                 "kind": kind,
                 "command": cmd_str,
@@ -663,14 +1109,46 @@ def run_independent_verification(
                 "exit_code": exit_code,
                 "timed_out": timed_out,
                 "duration_sec": duration,
-                "skipped_count": int(skip_info["skipped_count"]),
-                "skipped_tests": skip_info["skipped_tests"],
+                "skip_detection": check_skip_mode,
+                "skipped_count": check_skipped_count,
+                "skipped_tests": check_skipped_names,
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
             }
+            if exec_cmd != cmd_str:
+                check_entry["executed_command"] = exec_cmd
+            checks.append(check_entry)
+
+    # Aggregate tri-state skip observability across all test checks
+    if not test_skip_modes:
+        report_skip_detection = "not_applicable"
+        skipped_tests_total: int | None = 0
+    elif all(m == "unobservable" for m in test_skip_modes):
+        report_skip_detection = "unobservable"
+        skipped_tests_total = None
+    elif any(m == "unobservable" for m in test_skip_modes):
+        report_skip_detection = "partial"
+        skipped_tests_total = observed_skipped_total
+    elif all(m == "structured" for m in test_skip_modes):
+        report_skip_detection = "structured"
+        skipped_tests_total = observed_skipped_total
+    else:
+        report_skip_detection = "heuristic"
+        skipped_tests_total = observed_skipped_total
+
+    if unobservable_commands:
+        integrity_audit["warnings"].append(
+            {
+                "code": "unobservable_skips",
+                "commands": unobservable_commands[:10],
+                "message": (
+                    f"Skip detection was unobservable for {len(unobservable_commands)} test command(s) "
+                    f"({', '.join(unobservable_commands[:3])}); skipped test count may be incomplete."
+                ),
+            }
         )
 
-    if skipped_tests_total > 0:
+    if isinstance(skipped_tests_total, int) and skipped_tests_total > 0:
         sample = ", ".join(all_skipped_tests[:5])
         suffix = "..." if len(all_skipped_tests) > 5 else ""
         detail = f" ({sample}{suffix})" if sample else ""
@@ -685,6 +1163,27 @@ def run_independent_verification(
                 ),
             }
         )
+
+    # Guard: block verification when tests newly added or modified in this diff were skipped
+    if block_on_changed_test_skip and all_skipped_tests:
+        skipped_changed, changed_test_files = find_skipped_changed_tests(
+            worktree_path,
+            list(diff_info.get("all_changed_files") or []),
+            all_skipped_tests,
+        )
+        if skipped_changed:
+            integrity_audit["blocking_issues"].append(
+                {
+                    "code": "changed_tests_skipped",
+                    "file": ", ".join(changed_test_files[:5]),
+                    "tests": skipped_changed[:25],
+                    "message": (
+                        f"Changed/added test(s) were skipped during verification ({', '.join(skipped_changed[:10])}); "
+                        "configure required test prerequisites (e.g. TEST_DATABASE_URL) or ensure modified tests execute."
+                    ),
+                }
+            )
+            integrity_audit["passed"] = False
 
     # Overall pass requires: contract valid, zero failed verification checks, zero integrity blocking issues
     overall_passed = (
@@ -710,8 +1209,10 @@ def run_independent_verification(
         "commands_total": len(checks),
         "commands_passed": passed_count,
         "commands_failed": failed_count,
+        "skip_detection": report_skip_detection,
         "skipped_tests_total": skipped_tests_total,
         "skipped_tests": all_skipped_tests[:25],
+        "skipped_test_details": all_skipped_details[:25],
         "checks": checks,
         "prepare": prepare_report,
         "contract_integrity": contract_check,

@@ -21,7 +21,8 @@ interface VerificationCheck {
   passed: boolean;
   exit_code: number;
   duration_sec: number;
-  skipped_count?: number;
+  skip_detection?: string;
+  skipped_count?: number | null;
 }
 
 interface DiffFileItem {
@@ -277,9 +278,16 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
   const verTotal = Number(verSummary?.commands_total ?? checks.length ?? 0);
   const verPassed = Number(verSummary?.commands_passed ?? checks.filter((c) => c.passed).length ?? 0);
   const verFailed = Number(verSummary?.commands_failed ?? checks.filter((c) => !c.passed).length ?? 0);
-  const verSkipped = isVerifyingNow
+  const verSkipMode = isVerifyingNow
+    ? ""
+    : String(verSummary?.skip_detection ?? verFull?.skip_detection ?? "");
+  const rawVerSkipped = isVerifyingNow
     ? 0
-    : Number(verSummary?.skipped_tests_total ?? verFull?.skipped_tests_total ?? 0);
+    : (verSummary?.skipped_tests_total !== undefined
+        ? verSummary.skipped_tests_total
+        : verFull?.skipped_tests_total);
+  const verSkipsUnobservable = !isVerifyingNow && (verSkipMode === "unobservable" || rawVerSkipped === null);
+  const verSkipped = verSkipsUnobservable ? 0 : Number(rawVerSkipped ?? 0);
   const verSkippedNames: string[] = isVerifyingNow
     ? []
     : Array.isArray(verSummary?.skipped_tests)
@@ -363,7 +371,11 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
                   </div>
                 </div>
                 <div class="check-right">exit ${esc(c.exit_code)} · ${esc(c.duration_sec)}s${
-                  c.skipped_count && c.skipped_count > 0 ? ` · ${esc(c.skipped_count)} skip` : ""
+                  c.skip_detection === "unobservable" || c.skipped_count === null
+                    ? " · skip ?"
+                    : c.skipped_count && c.skipped_count > 0
+                      ? ` · ${esc(c.skipped_count)} skip`
+                      : ""
                 }</div>
               </div>
             `,
@@ -378,9 +390,25 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
     const blockingCount = Number(verSummary.blocking_audit_issues ?? 0);
     const warnCount = Number(verSummary.warnings ?? 0);
     auditChips.push({ text: `AUDIT ${blockingCount === 0 ? "CLEAN" : `${blockingCount} BLOCKING`}` });
-    if (verSkipped > 0) {
+    if (verSkipsUnobservable) {
+      auditChips.push({
+        text: "SKIPS UNOBSERVABLE",
+        warn: true,
+        title: "Test command output did not emit machine-readable skip counts.",
+      });
+    } else if (verSkipped > 0) {
       const tip = verSkippedNames.length > 0 ? `Skipped: ${verSkippedNames.slice(0, 8).join(", ")}` : `${verSkipped} test(s) skipped`;
-      auditChips.push({ text: `${verSkipped} SKIPPED`, warn: true, title: tip });
+      auditChips.push({
+        text: `${verSkipped} SKIPPED${verSkipMode === "partial" ? " (PARTIAL)" : ""}`,
+        warn: true,
+        title: tip,
+      });
+    } else if (verSkipMode === "partial") {
+      auditChips.push({
+        text: "SKIPS PARTIAL",
+        warn: true,
+        title: "Some test commands had unobservable skip counts.",
+      });
     }
     if (warnCount > 0) auditChips.push({ text: `${warnCount} WARN`, warn: true });
   }
@@ -519,7 +547,13 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
           isVerifyingNow
             ? "Running checks…"
             : verTotal > 0
-              ? `${verPassed} pass · ${verFailed} fail${verSkipped > 0 ? ` · ${verSkipped} skip` : ""}`
+              ? `${verPassed} pass · ${verFailed} fail${
+                  verSkipsUnobservable
+                    ? " · skip ?"
+                    : verSkipped > 0
+                      ? ` · ${verSkipped} skip`
+                      : ""
+                }`
               : "Not run"
         }</div>
       </div>

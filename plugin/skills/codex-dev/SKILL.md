@@ -91,7 +91,7 @@ When state is `REVIEWING`:
 3. Verify semantically against the immutable `PLAN.md`:
    - Every acceptance criterion is genuinely satisfied.
    - No tests, linters, type checks, or configs were weakened or bypassed.
-   - Check `verification_summary.skipped_tests_total` and `skipped_tests`: if tests were skipped (e.g., DB integration tests waiting on `TEST_DATABASE_URL`), verify whether it is an environment prerequisite (which can be configured via `repo_overrides.<repo_path>.verify.env` in `~/.codex-dev/config.json` or `<repo>/.codex-dev.local.json`) and report skipped coverage explicitly to the user.
+   - Check `verification_summary.skip_detection`, `skipped_tests_total`, and `skipped_tests`: supported runners (`go test`, `pytest`, `jest`, `vitest`) are instrumented with structured reporting (`-json` / `--junitxml` / JSON output) so skipped tests are never silently missed; opaque test commands report `skip_detection: "unobservable"` and `skipped_tests_total: null`. Newly added or modified tests that get skipped automatically fail verification (`changed_tests_skipped`). For pre-existing skipped tests (e.g., DB integration tests waiting on `TEST_DATABASE_URL`), verify whether it is an environment prerequisite (which can be configured via `repo_overrides.<repo_path>.verify.env` in `~/.codex-dev/config.json` or `<repo>/.codex-dev.local.json`) and report skipped coverage explicitly to the user.
    - No unintended or out-of-scope edits exist.
    - Edge cases, error handling, readability, and security are solid.
 4. Record the verdict:

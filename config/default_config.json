@@ -40,7 +40,9 @@
   "verify": {
     "commands": [],
     "env": {},
-    "no_cache": true
+    "no_cache": true,
+    "structured_reporting": true,
+    "block_on_changed_test_skip": true
   },
   "repo_overrides": {},
   "model_policy": {

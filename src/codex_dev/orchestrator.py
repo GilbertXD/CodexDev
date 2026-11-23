@@ -1056,7 +1056,9 @@ class Orchestrator:
             )
 
             state["diff_stats"] = report["diff_stats"]
-            skipped_total = int(report.get("skipped_tests_total", 0))
+            skip_detection = str(report.get("skip_detection") or "heuristic")
+            raw_skipped_total = report.get("skipped_tests_total")
+            skipped_total: int | None = None if raw_skipped_total is None else int(raw_skipped_total)
             skipped_names = list(report.get("skipped_tests") or [])
             state["verification_summary"] = {
                 "verified_at": report["verified_at"],
@@ -1065,6 +1067,7 @@ class Orchestrator:
                 "commands_total": report["commands_total"],
                 "commands_passed": report["commands_passed"],
                 "commands_failed": report["commands_failed"],
+                "skip_detection": skip_detection,
                 "skipped_tests_total": skipped_total,
                 "skipped_tests": skipped_names,
                 "contract_valid": report["contract_integrity"]["valid"],
@@ -1078,18 +1081,26 @@ class Orchestrator:
                         "passed": c["passed"],
                         "exit_code": c["exit_code"],
                         "duration_sec": c["duration_sec"],
-                        "skipped_count": int(c.get("skipped_count", 0)),
+                        "skip_detection": str(c.get("skip_detection") or "not_applicable"),
+                        "skipped_count": None if c.get("skipped_count") is None else int(c["skipped_count"]),
                     }
                     for c in report["checks"]
                 ],
                 "failure_reasons": report["failure_reasons"],
             }
 
+            if skipped_total is None:
+                skip_log_part = f" | Skipped tests: `unobservable` ({skip_detection})"
+            elif skipped_total > 0:
+                skip_log_part = f" | Skipped tests: `{skipped_total}` ({skip_detection})"
+            else:
+                skip_log_part = ""
+
             self.store.append_execution_log(
                 tid,
                 f"Independent Verification ({'PASSED' if report['passed'] else 'FAILED'})",
                 f"- Source: `{report['command_source']}` | Passed: `{report['commands_passed']}/{report['commands_total']}`"
-                + (f" | Skipped tests: `{skipped_total}`" if skipped_total > 0 else "")
+                + skip_log_part
                 + "\n"
                 f"- Contract integrity: `{report['contract_integrity']['valid']}`\n"
                 f"- Audit blocking issues: `{len(report['diff_audit']['blocking_issues'])}` | Warnings: `{len(report['diff_audit']['warnings'])}`\n"
@@ -1098,7 +1109,12 @@ class Orchestrator:
             )
 
             if report["passed"]:
-                skip_note = f", {skipped_total} test(s) skipped" if skipped_total > 0 else ""
+                if skipped_total is None:
+                    skip_note = ", skips unobservable"
+                elif skipped_total > 0:
+                    skip_note = f", {skipped_total} test(s) skipped"
+                else:
+                    skip_note = ""
                 self.store.transition(
                     tid,
                     state,
@@ -1111,6 +1127,7 @@ class Orchestrator:
                     details={
                         "commands_passed": report["commands_passed"],
                         "commands_total": report["commands_total"],
+                        "skip_detection": skip_detection,
                         "skipped_tests_total": skipped_total,
                     },
                 )
