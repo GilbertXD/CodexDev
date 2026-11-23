@@ -1219,6 +1219,126 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertEqual(res3["state"]["token_usage"]["input_tokens"], 1240)
         self.assertEqual(res3["state"]["token_usage"]["output_tokens"], 310)
 
+    def test_26_sandbox_builder_checks_stack_agnostic_loopback_filter(self) -> None:
+        from codex_dev.sandbox_filter import (
+            detect_go_loopback_tests,
+            detect_js_loopback_test_files,
+            detect_python_loopback_tests,
+            detect_rust_loopback_tests,
+            filter_builder_checks_for_sandbox,
+        )
+
+        # 1) Go: direct httptest.NewServer + helper calling net.Listen; pure unit test stays included
+        go_wt = self.tmp_path / "go_filter_wt"
+        (go_wt / "pkg").mkdir(parents=True)
+        (go_wt / "pkg" / "server_test.go").write_text(
+            "package pkg\n"
+            "import (\"net\"; \"net/http/httptest\"; \"testing\")\n"
+            "func startFixture(t *testing.T) { _, _ = net.Listen(\"tcp\", \"127.0.0.1:0\") }\n"
+            "func TestPureUnit(t *testing.T) {}\n"
+            "func TestHTTPFixture(t *testing.T) { _ = httptest.NewServer(nil) }\n"
+            "func TestViaHelper(t *testing.T) { startFixture(t) }\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(detect_go_loopback_tests(go_wt), ["TestHTTPFixture", "TestViaHelper"])
+        go_filtered = filter_builder_checks_for_sandbox(
+            ["go vet ./...", "go test -race -short ./..."],
+            go_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=False,
+        )
+        self.assertTrue(go_filtered["rewritten"])
+        self.assertEqual(go_filtered["deferred_tests"], ["TestHTTPFixture", "TestViaHelper"])
+        self.assertEqual(go_filtered["checks"][0], "go vet ./...")
+        self.assertIn("-skip '^(TestHTTPFixture|TestViaHelper)$'", go_filtered["checks"][1])
+
+        # Bypassed when builder.network_access=True
+        go_net = filter_builder_checks_for_sandbox(
+            ["go test -race -short ./..."],
+            go_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=True,
+        )
+        self.assertFalse(go_net["rewritten"])
+        self.assertEqual(go_net["checks"], ["go test -race -short ./..."])
+
+        # 2) Python / pytest
+        py_wt = self.tmp_path / "py_filter_wt"
+        (py_wt / "tests").mkdir(parents=True)
+        (py_wt / "tests" / "test_api.py").write_text(
+            "from http.server import HTTPServer\n"
+            "def test_pure():\n    assert 1 + 1 == 2\n\n"
+            "def test_loopback_http():\n    srv = HTTPServer(('127.0.0.1', 0), None)\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(detect_python_loopback_tests(py_wt), ["test_loopback_http"])
+        py_filtered = filter_builder_checks_for_sandbox(
+            ["python3 -m pytest -q"],
+            py_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=False,
+        )
+        self.assertTrue(py_filtered["rewritten"])
+        self.assertIn("-k 'not (test_loopback_http)'", py_filtered["checks"][0])
+
+        # 3) JS / Jest & Vitest
+        js_wt = self.tmp_path / "js_filter_wt"
+        (js_wt / "tests").mkdir(parents=True)
+        (js_wt / "tests" / "pure.test.ts").write_text("test('math', () => expect(1).toBe(1));\n", encoding="utf-8")
+        (js_wt / "tests" / "http.spec.ts").write_text(
+            "import http from 'node:http';\nhttp.createServer().listen(0);\n", encoding="utf-8"
+        )
+        self.assertEqual(detect_js_loopback_test_files(js_wt), ["tests/http.spec.ts"])
+        js_filtered = filter_builder_checks_for_sandbox(
+            ["npx jest", "npx vitest run"],
+            js_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=False,
+        )
+        self.assertIn("--testPathIgnorePatterns", js_filtered["checks"][0])
+        self.assertIn("--exclude tests/http.spec.ts", js_filtered["checks"][1])
+
+        # 4) Rust / cargo test
+        rs_wt = self.tmp_path / "rs_filter_wt"
+        (rs_wt / "tests").mkdir(parents=True)
+        (rs_wt / "tests" / "net.rs").write_text(
+            "#[test]\nfn pure_test() { assert_eq!(1, 1); }\n\n"
+            "#[tokio::test]\nasync fn binds_port() { let _ = TcpListener::bind(\"127.0.0.1:0\"); }\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(detect_rust_loopback_tests(rs_wt), ["binds_port"])
+        rs_filtered = filter_builder_checks_for_sandbox(
+            ["cargo test"],
+            rs_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=False,
+        )
+        self.assertEqual(rs_filtered["checks"][0], "cargo test -- --skip binds_port")
+
+        # 5) End-to-end orchestrator dispatch injects filtered Builder Checks & logs event without altering target repo
+        repo = _create_python_repo(self.tmp_path / "e2e_filter_repo")
+        (repo / "test_socket.py").write_text(
+            "import socket\ndef test_bind_port():\n    s = socket.socket(); s.bind(('127.0.0.1', 0))\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "test_socket.py"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add socket test"], cwd=repo, check=True, capture_output=True)
+        rec_file = self.tmp_path / "e2e_filter_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Sandbox auto filter", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(
+            tid,
+            PLAN_PY + "\n## Builder Checks\n- `pytest -q`\n",
+        )
+        exec_res = self.orch.execute_round(tid)
+        self.assertTrue(exec_res["ok"])
+        rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
+        self.assertIn("pytest -q -k 'not (test_bind_port)'", rec["prompt"])
+        self.assertIn("automatically deferred to host verification", rec["prompt"])
+        ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
+        self.assertIn("builder_checks_filtered", ev_types)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

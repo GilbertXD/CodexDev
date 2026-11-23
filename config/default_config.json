@@ -25,7 +25,9 @@
   "builder_add_dirs": [],
   "builder_isolation": "strict",
   "builder": {
-    "network_access": false
+    "network_access": false,
+    "auto_filter_sandbox_tests": true,
+    "skip_tests": []
   },
   "prepare": {
     "enabled": true,

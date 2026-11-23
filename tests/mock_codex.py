@@ -53,6 +53,7 @@ def main() -> int:
                 "cd": str(wt),
                 "has_feedback": "REPAIR ROUND" in prompt,
                 "has_builder_checks": "SANDBOX-SAFE BUILDER CHECKS" in prompt,
+                "prompt": prompt,
                 "prompt_len": len(prompt),
                 "add_dirs": args.add_dir,
                 "disabled": args.disable,

@@ -37,6 +37,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "builder_isolation": "strict",
     "builder": {
         "network_access": False,
+        "auto_filter_sandbox_tests": True,
+        "skip_tests": [],
     },
     "prepare": {
         "enabled": True,

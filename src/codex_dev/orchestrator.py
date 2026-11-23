@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_runner import build_codex_prompt, run_codex_exec
+from .sandbox_filter import filter_builder_checks_for_sandbox
 from .config import (
     ensure_default_global_config,
     get_codex_dev_home,
@@ -502,12 +503,39 @@ class Orchestrator:
 
             plan_text = (tdir / "PLAN.md").read_text(encoding="utf-8")
             contract_doc = read_json(tdir / "contract.json") or {}
-            builder_checks = list(contract_doc.get("builder_checks") or [])
+            raw_builder_checks = list(contract_doc.get("builder_checks") or [])
             builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
             builder_network_access = bool(builder_cfg.get("network_access", False))
+            sandbox_mode = str(cfg.get("sandbox_mode") or "workspace-write")
             feedback_path = tdir / "FEEDBACK.md"
             feedback_text = feedback_path.read_text(encoding="utf-8") if feedback_path.is_file() else None
             worktree_path = Path(meta["worktree_path"])
+
+            filter_res = filter_builder_checks_for_sandbox(
+                raw_builder_checks,
+                worktree_path,
+                sandbox_mode=sandbox_mode,
+                builder_network_access=builder_network_access,
+                auto_filter=bool(builder_cfg.get("auto_filter_sandbox_tests", True)),
+                extra_skip_tests=builder_cfg.get("skip_tests") if isinstance(builder_cfg.get("skip_tests"), list) else None,
+            )
+            builder_checks = filter_res["checks"]
+            deferred_sandbox_tests = filter_res["deferred_tests"]
+            if filter_res["rewritten"]:
+                self.store.append_event(
+                    tid,
+                    phase="execute",
+                    agent="Orchestrator",
+                    event_type="builder_checks_filtered",
+                    message=(
+                        f"Auto-deferred {len(deferred_sandbox_tests)} socket/loopback test(s) from sandbox Builder Checks "
+                        f"to host verification: {', '.join(deferred_sandbox_tests[:8])}"
+                    ),
+                    details={
+                        "deferred_tests": deferred_sandbox_tests,
+                        "filtered_checks": builder_checks,
+                    },
+                )
 
             prompt = build_codex_prompt(
                 task_name=meta["name"],
@@ -517,6 +545,7 @@ class Orchestrator:
                 worktree_path=worktree_path,
                 builder_checks=builder_checks or None,
                 builder_network_access=builder_network_access,
+                deferred_sandbox_tests=deferred_sandbox_tests or None,
             )
 
             eff_timeout, eff_idle_timeout = resolve_codex_timeouts(
@@ -527,7 +556,6 @@ class Orchestrator:
                 reasoning_effort=selection.reasoning_effort,
             )
             codex_bin = str(cfg.get("codex_binary") or "codex")
-            sandbox_mode = str(cfg.get("sandbox_mode") or "workspace-write")
 
             def _live_usage_cb(usage: dict[str, Any]) -> None:
                 state["token_usage"] = _merge_token_totals(state.get("token_usage"), usage)

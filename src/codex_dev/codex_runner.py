@@ -132,6 +132,7 @@ def build_codex_prompt(
     worktree_path: Path,
     builder_checks: list[str] | None = None,
     builder_network_access: bool = False,
+    deferred_sandbox_tests: list[str] | None = None,
 ) -> str:
     """Build deterministic builder instructions for Codex CLI."""
     if builder_network_access:
@@ -179,9 +180,16 @@ def build_codex_prompt(
                 "",
                 "=== SANDBOX-SAFE BUILDER CHECKS (RUN THESE INSIDE THE SANDBOX) ===",
                 *(f"- `{cmd}`" for cmd in builder_checks),
-                "=== END BUILDER CHECKS ===",
             ]
         )
+        if deferred_sandbox_tests:
+            parts.append(
+                "Note: Socket/loopback-binding test(s) automatically deferred to host verification: "
+                + ", ".join(f"`{t}`" for t in deferred_sandbox_tests[:25])
+                + (f" (+{len(deferred_sandbox_tests) - 25} more)" if len(deferred_sandbox_tests) > 25 else "")
+                + ". Do NOT retry them inside the offline sandbox."
+            )
+        parts.append("=== END BUILDER CHECKS ===")
     if repair_round > 0 and feedback_text and feedback_text.strip():
         parts.extend(
             [
