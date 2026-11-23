@@ -975,6 +975,31 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         records = json.loads(rec_file.read_text(encoding="utf-8"))
         self.assertIn("sandbox_workspace_write.network_access=true", records[1]["configs"])
 
+    def test_22_post_turn_completed_graceful_termination(self) -> None:
+        cfg_path = self.orch.home_dir / "config.json"
+        cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg_data["codex_post_turn_grace_sec"] = 1
+        cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+
+        repo = _create_python_repo(self.tmp_path / "post_turn_hang_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "hang_after_turn_completed"
+        tid = self.orch.init_task(name="Post turn grace termination", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+
+        round_res = self.orch.run_round(tid, codex_timeout_sec=20)
+        self.assertTrue(round_res["ok"])
+        self.assertEqual(round_res["next_action"], "review_required")
+        outcome = round_res["execution"]["outcome"]
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["exit_code"], 0)
+        self.assertLess(outcome["duration_sec"], 6.0)
+        self.assertEqual(outcome["structured_result"]["status"], "completed")
+
+        result_doc = json.loads((self.orch.store.task_dir(tid) / "RESULT.json").read_text(encoding="utf-8"))
+        self.assertTrue(result_doc["graceful_post_turn_exit"])
+        events = self.orch.store.read_events(tid)
+        self.assertIn("codex_graceful_exit", [e.get("type") for e in events])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

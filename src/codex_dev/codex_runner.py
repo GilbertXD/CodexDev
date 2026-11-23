@@ -330,6 +330,20 @@ def _format_stderr_tail(chunks: list[str], *, max_lines: int = 40) -> str:
     return "\n".join(tail).strip()
 
 
+def _has_valid_result_file(path: Path) -> bool:
+    """Return True if the --output-last-message file exists and contains a valid JSON object."""
+    if not path.is_file():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return False
+        parsed = json.loads(raw)
+        return isinstance(parsed, dict)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _toml_quote(val: str) -> str:
     return json.dumps(str(val))
 
@@ -348,6 +362,7 @@ def run_codex_exec(
     repair_round: int,
     attempt: int = 1,
     idle_timeout_sec: int = 0,
+    post_turn_grace_sec: float = 4.0,
     builder_env: dict[str, str] | None = None,
     builder_add_dirs: list[str] | None = None,
     builder_isolation: str = "strict",
@@ -541,19 +556,39 @@ def run_codex_exec(
     timed_out = False
     timeout_reason: str | None = None
     cancelled = False
+    graceful_post_turn_exit = False
+    turn_completed_seen = False
     events_seen = 0
     latest_usage: dict[str, Any] | None = None
     last_error_msg: str | None = None
 
+    def _mark_turn_completed() -> None:
+        nonlocal turn_completed_seen
+        with activity_lock:
+            turn_completed_seen = True
+
+    def _is_turn_completed() -> bool:
+        with activity_lock:
+            return turn_completed_seen
+
     def _watchdog() -> None:
-        nonlocal timed_out, timeout_reason, cancelled
+        nonlocal timed_out, timeout_reason, cancelled, graceful_post_turn_exit
         deadline = start_ts + max(1, timeout_sec)
+        ready_to_exit_ts: float | None = None
         while proc.poll() is None:
             if cancel_flag.exists():
                 cancelled = True
                 _terminate_process_group(proc)
                 return
             now = time.monotonic()
+            if post_turn_grace_sec > 0 and _is_turn_completed():
+                if ready_to_exit_ts is None:
+                    if _has_valid_result_file(result_file_path):
+                        ready_to_exit_ts = now
+                elif (now - ready_to_exit_ts) >= post_turn_grace_sec:
+                    graceful_post_turn_exit = True
+                    _terminate_process_group(proc)
+                    return
             if now >= deadline:
                 timed_out = True
                 timeout_reason = "wall_clock"
@@ -592,6 +627,9 @@ def run_codex_exec(
                         latest_usage = usage
                         if on_token_usage:
                             on_token_usage(usage)
+
+                    if ev.get("type") == "turn.completed":
+                        _mark_turn_completed()
 
                     summary = _summarize_jsonl_event(ev)
                     if summary:
@@ -645,15 +683,34 @@ def run_codex_exec(
             structured_result = None
 
     # Save/update canonical RESULT.json snapshot
+    effective_exit_code = 0 if (graceful_post_turn_exit and structured_result is not None and not cancelled and not timed_out) else exit_code
+    if graceful_post_turn_exit and structured_result is not None and not cancelled and not timed_out:
+        store.append_event(
+            task_id,
+            phase="execute",
+            agent="Codex CLI (Builder)",
+            event_type="codex_graceful_exit",
+            message=(
+                f"Codex CLI lingered after turn.completed with output saved; "
+                f"terminated process group gracefully after {post_turn_grace_sec}s grace period."
+            ),
+            details={
+                "round": repair_round,
+                "attempt": attempt,
+                "raw_exit_code": exit_code,
+                "post_turn_grace_sec": post_turn_grace_sec,
+            },
+        )
     result_doc = {
         "round": repair_round,
         "attempt": attempt,
         "model": model,
-        "exit_code": exit_code,
+        "exit_code": effective_exit_code,
         "timed_out": timed_out,
         "timeout_reason": timeout_reason,
         "timeout_sec": timeout_sec,
         "idle_timeout_sec": idle_timeout_sec,
+        "graceful_post_turn_exit": graceful_post_turn_exit,
         "cancelled": cancelled,
         "duration_sec": duration,
         "token_usage": latest_usage,
@@ -711,11 +768,11 @@ def run_codex_exec(
             timeout_reason=timeout_reason,
         )
 
-    if exit_code != 0:
-        err = last_error_msg or stderr_tail or f"Codex CLI exited abnormally with code {exit_code}"
+    if effective_exit_code != 0:
+        err = last_error_msg or stderr_tail or f"Codex CLI exited abnormally with code {effective_exit_code}"
         return CodexRunOutcome(
             ok=False,
-            exit_code=exit_code,
+            exit_code=effective_exit_code,
             timed_out=False,
             cancelled=False,
             failure_category="execution_failure",

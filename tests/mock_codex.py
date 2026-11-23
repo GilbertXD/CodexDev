@@ -164,6 +164,13 @@ def main() -> int:
         (wt / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n", encoding="utf-8")
         (wt / "main.go").write_text("package main\n\nfunc main() {}\n", encoding="utf-8")
         summary = "Updated go.mod and main.go."
+    elif scenario == "hang_after_turn_completed":
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Finished work, emitted turn.completed and result file, then hung on teardown."
     elif scenario == "ready_for_verify":
         (wt / "calc.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b\n\n"
@@ -276,6 +283,8 @@ def main() -> int:
     }
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(json.dumps(result_obj, indent=2), encoding="utf-8")
+    if scenario == "hang_after_turn_completed":
+        time.sleep(30)
     return 0
 
 

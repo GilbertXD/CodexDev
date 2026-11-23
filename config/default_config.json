@@ -5,6 +5,7 @@
   "max_repair_rounds": 3,
   "codex_timeout_sec": 600,
   "codex_idle_timeout_sec": 300,
+  "codex_post_turn_grace_sec": 4,
   "codex_timeout_by_effort": {
     "low": 600,
     "medium": 600,
