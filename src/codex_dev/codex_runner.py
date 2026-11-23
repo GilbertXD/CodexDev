@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,15 +54,54 @@ def _sync_symlink(link_path: Path, target_path: Path) -> None:
         pass
 
 
+def _seed_fresh_models_cache(src_path: Path, dst_path: Path) -> None:
+    """Copy local models_cache.json into isolated CODEX_HOME with a fresh fetched_at timestamp.
+
+    Prevents offline Codex CLI sessions from blocking on startup remote model-refresh timeouts
+    while keeping the user's original ~/.codex/models_cache.json strictly read-only.
+    """
+    if not src_path.is_file():
+        if dst_path.is_symlink() or dst_path.is_file():
+            try:
+                dst_path.unlink()
+            except OSError:
+                pass
+        return
+
+    # Always remove legacy symlinks before writing so we never write through to ~/.codex/
+    if dst_path.is_symlink():
+        try:
+            dst_path.unlink()
+        except OSError:
+            pass
+
+    try:
+        raw = src_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        atomic_write_text(dst_path, raw)
+        return
+
+    if isinstance(parsed, dict):
+        parsed["fetched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        atomic_write_json(dst_path, parsed)
+    else:
+        atomic_write_text(dst_path, raw)
+
+
 def prepare_isolated_codex_home(
     codex_dev_home: Path,
     source_codex_home: Path | None = None,
 ) -> Path:
     """Provision a clean, plugin/skill-free CODEX_HOME under ~/.codex-dev/codex_home.
 
-    Symlinks only auth.json and models_cache.json from the user's real ~/.codex
-    (read-only, never modifying ~/.codex) and writes a minimal config.toml with
-    no third-party plugins, skills, MCP servers, AGENTS.md, or desktop notify hooks.
+    Symlinks auth.json read-only, seeds a fresh local copy of models_cache.json
+    (never modifying ~/.codex), and writes a minimal config.toml with no third-party
+    plugins, skills, MCP servers, AGENTS.md, or desktop notify hooks.
     """
     isolated_dir = (codex_dev_home / "codex_home").resolve()
     isolated_dir.mkdir(parents=True, exist_ok=True)
@@ -72,8 +112,8 @@ def prepare_isolated_codex_home(
 
     src_home = (source_codex_home or get_codex_home()).resolve()
     if src_home != isolated_dir:
-        for fname in ("auth.json", "models_cache.json"):
-            _sync_symlink(isolated_dir / fname, src_home / fname)
+        _sync_symlink(isolated_dir / "auth.json", src_home / "auth.json")
+        _seed_fresh_models_cache(src_home / "models_cache.json", isolated_dir / "models_cache.json")
 
     minimal_toml = (
         "# Managed by codex-dev (strict Builder isolation). Do not place personal plugins/skills here.\n"

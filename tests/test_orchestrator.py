@@ -877,7 +877,15 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         fake_user_codex = self.tmp_path / "user_codex_home"
         fake_user_codex.mkdir(parents=True, exist_ok=True)
         (fake_user_codex / "auth.json").write_text('{"token":"fake-auth"}\n', encoding="utf-8")
-        (fake_user_codex / "models_cache.json").write_text('{"models":[]}\n', encoding="utf-8")
+        stale_ts = "2020-01-01T00:00:00.000000Z"
+        (fake_user_codex / "models_cache.json").write_text(
+            json.dumps({"fetched_at": stale_ts, "models": [{"slug": "gpt-6-luna"}]}) + "\n",
+            encoding="utf-8",
+        )
+        # Pre-seed a legacy symlink in isolated codex_home to ensure upgrade never writes through to ~/.codex
+        pre_iso = (self.orch.home_dir / "codex_home").resolve()
+        pre_iso.mkdir(parents=True, exist_ok=True)
+        (pre_iso / "models_cache.json").symlink_to(fake_user_codex / "models_cache.json")
         (fake_user_codex / "AGENTS.md").write_text("# Personal instructions\n", encoding="utf-8")
         (fake_user_codex / "skills").mkdir(exist_ok=True)
         (fake_user_codex / "skills" / "custom.md").write_text("personal skill\n", encoding="utf-8")
@@ -906,7 +914,14 @@ class TestCodexDevOrchestrator(unittest.TestCase):
 
             iso_dir = Path(expected_iso)
             self.assertTrue((iso_dir / "auth.json").is_symlink())
-            self.assertTrue((iso_dir / "models_cache.json").is_symlink())
+            self.assertFalse((iso_dir / "models_cache.json").is_symlink())
+            self.assertTrue((iso_dir / "models_cache.json").is_file())
+            iso_cache = json.loads((iso_dir / "models_cache.json").read_text(encoding="utf-8"))
+            self.assertEqual(iso_cache["models"], [{"slug": "gpt-6-luna"}])
+            self.assertNotEqual(iso_cache["fetched_at"], stale_ts)
+            # User's original ~/.codex/models_cache.json must remain untouched
+            orig_cache = json.loads((fake_user_codex / "models_cache.json").read_text(encoding="utf-8"))
+            self.assertEqual(orig_cache["fetched_at"], stale_ts)
             self.assertEqual((iso_dir / "auth.json").resolve(), (fake_user_codex / "auth.json").resolve())
             self.assertFalse((iso_dir / "AGENTS.md").exists())
             self.assertFalse((iso_dir / "skills").exists())
