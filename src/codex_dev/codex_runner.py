@@ -173,6 +173,7 @@ def build_codex_prompt(
     builder_checks: list[str] | None = None,
     builder_network_access: bool = False,
     deferred_sandbox_tests: list[str] | None = None,
+    planned_dependency_manifests: list[str] | None = None,
 ) -> str:
     """Build deterministic builder instructions for Codex CLI."""
     if builder_network_access:
@@ -187,16 +188,22 @@ def build_codex_prompt(
         )
     else:
         sandbox_rule = (
-            "7. You are running inside a `workspace-write` sandbox with a pre-configured writable "
+            "7. You are running inside an OFFLINE `workspace-write` sandbox with a pre-configured writable "
             "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
-            "polluting the repo). Prefer running offline/unit package tests that do not require "
-            "outbound network access, loopback port binding (e.g. 127.0.0.1), a live database, or the "
-            "Docker daemon (do NOT probe `docker info` or retry blocked integration tests). The "
+            "polluting the repo, while the shared module cache is read-only and outbound network / "
+            "loopback socket binds are denied with EPERM). Prefer running offline/unit package tests that "
+            "do not require outbound network access, loopback port binding (e.g. 127.0.0.1 via "
+            "`httptest.NewServer`, `net.Listen`, `miniredis.RunT`), a live database, or the Docker daemon (do NOT probe "
+            "`docker info` or retry blocked integration/loopback tests). If this task adds new third-party "
+            "dependencies not yet in the local read-only module cache, do NOT attempt network downloads "
+            "(`go mod download`, `npm install`, `pip install`) or hand-edit checksum lockfiles (`go.sum`); "
+            "edit the manifest (`go.mod`, etc.), verify packages that do not depend on the uncached modules "
+            "(e.g. `GOPROXY=off go vet/test` on unaffected packages), and hand off cleanly. The "
             "`Verification Commands` section in PLAN.md will be executed as independent verification on "
             "the host by the Orchestrator (including non-sandbox dependency preparation such as `go mod tidy`) after "
             "you finish. When your implementation is complete and sandbox-safe checks pass, return "
             "`status: \"ready_for_verify\"` (do NOT mark `status: \"partial\"` merely because host-only "
-            "verification commands have not run inside the sandbox)."
+            "verification commands or uncached-module packages could not run inside the offline sandbox)."
         )
 
     parts = [
@@ -237,6 +244,20 @@ def build_codex_prompt(
                 + ". Do NOT retry them inside the offline sandbox."
             )
         parts.append("=== END BUILDER CHECKS ===")
+    if not builder_network_access and planned_dependency_manifests:
+        parts.extend(
+            [
+                "",
+                "=== OFFLINE SANDBOX DEPENDENCY NOTICE ===",
+                "Target Files include dependency manifest(s): "
+                + ", ".join(f"`{m}`" for m in planned_dependency_manifests[:10])
+                + ". Any newly added third-party dependencies will be downloaded and tidied on the host "
+                "by the Orchestrator's automatic dependency preparation step (e.g. `go mod tidy`) before host verification. "
+                "Do NOT attempt network downloads or manually synthesize checksum lockfiles (`go.sum`) inside the offline sandbox; "
+                "run offline checks on packages without uncached imports and return `status: \"ready_for_verify\"`.",
+                "=== END DEPENDENCY NOTICE ===",
+            ]
+        )
     if repair_round > 0 and feedback_text and feedback_text.strip():
         parts.extend(
             [

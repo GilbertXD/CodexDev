@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_runner import build_codex_prompt, run_codex_exec
-from .sandbox_filter import filter_builder_checks_for_sandbox
+from .sandbox_filter import detect_plan_dependency_manifests, filter_builder_checks_for_sandbox
 from .config import (
     ensure_default_global_config,
     get_codex_dev_home,
@@ -638,6 +638,12 @@ class Orchestrator:
                     },
                 )
 
+            planned_manifests = (
+                detect_plan_dependency_manifests(contract_doc.get("target_files"))
+                if (sandbox_mode == "workspace-write" and not builder_network_access and repair_round == 0)
+                else []
+            )
+
             prompt = build_codex_prompt(
                 task_name=meta["name"],
                 plan_text=plan_text,
@@ -647,6 +653,7 @@ class Orchestrator:
                 builder_checks=builder_checks or None,
                 builder_network_access=builder_network_access,
                 deferred_sandbox_tests=deferred_sandbox_tests or None,
+                planned_dependency_manifests=planned_manifests or None,
             )
 
             eff_timeout, eff_idle_timeout = resolve_codex_timeouts(

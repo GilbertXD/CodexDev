@@ -34,9 +34,34 @@ SKIP_WALK_DIRS = frozenset(
 
 # --- Go loopback / socket bind detection ---
 _GO_BIND_RE = re.compile(
-    r"\b(?:httptest\.New(?:TLS|Unstarted)?Server|net\.Listen(?:TCP|UDP|Packet|Unix)?|http\.ListenAndServe(?:TLS)?)\s*\("
+    r"\b(?:"
+    r"httptest\.New(?:TLS|Unstarted)?Server"
+    r"|net\.Listen(?:TCP|UDP|Packet|Unix)?"
+    r"|tls\.Listen"
+    r"|http\.ListenAndServe(?:TLS)?"
+    r"|miniredis\.(?:RunT?|NewMiniRedis)"
+    r"|embeddedpostgres\.NewDatabase"
+    r")\s*\("
 )
 _GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+_DEPENDENCY_MANIFEST_RE = re.compile(
+    r"(?:^|/)(?:go\.mod|package\.json|Cargo\.toml|pyproject\.toml|requirements(?:[-_.][A-Za-z0-9]+)?\.txt|Gemfile|pom\.xml|build\.gradle(?:\.kts)?)$"
+)
+
+
+def detect_plan_dependency_manifests(target_files: list[str] | None) -> list[str]:
+    """Return deduplicated dependency manifest paths declared in PLAN.md Target Files."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in target_files or []:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip().lstrip("./")
+        if cleaned and _DEPENDENCY_MANIFEST_RE.search(cleaned) and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
 
 # --- Python loopback / socket bind detection ---
 _PY_BIND_RE = re.compile(
@@ -116,8 +141,8 @@ def detect_go_loopback_tests(worktree_path: Path) -> list[str]:
         binding_funcs = {name for name, body in pkg_blocks.items() if _GO_BIND_RE.search(body)}
         if not binding_funcs:
             continue
-        # Propagate through package-local test helpers (up to 3 hops)
-        for _ in range(3):
+        # Propagate through package-local test helpers (up to 5 hops)
+        for _ in range(5):
             added = False
             helper_pat = re.compile(
                 r"\b(?:" + "|".join(re.escape(h) for h in sorted(binding_funcs)) + r")\s*\("

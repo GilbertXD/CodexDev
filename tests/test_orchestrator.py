@@ -1694,6 +1694,78 @@ Add standalone documents with migration, API, and integration tests.
         block_codes = [b["code"] for b in ver_g["report"]["diff_audit"]["blocking_issues"]]
         self.assertIn("changed_tests_skipped", block_codes)
 
+    def test_31_offline_sandbox_embedded_servers_and_manifest_guidance(self) -> None:
+        from codex_dev.sandbox_filter import (
+            detect_go_loopback_tests,
+            detect_plan_dependency_manifests,
+            filter_builder_checks_for_sandbox,
+        )
+
+        # 1) Go embedded loopback servers (miniredis, tls.Listen, embeddedpostgres) + 4-hop helper chain
+        go_wt = self.tmp_path / "go_embedded_wt"
+        (go_wt / "internal" / "cache").mkdir(parents=True)
+        (go_wt / "internal" / "cache" / "redis_test.go").write_text(
+            "package cache\n"
+            "import (\"crypto/tls\"; \"testing\")\n"
+            "func hop4() { _ = miniredis.Run() }\n"
+            "func hop3() { hop4() }\n"
+            "func hop2() { hop3() }\n"
+            "func hop1() { hop2() }\n"
+            "func TestPureCacheKey(t *testing.T) {}\n"
+            "func TestRedisSearchCache(t *testing.T) { _ = miniredis.RunT(t) }\n"
+            "func TestNewMiniRedis(t *testing.T) { _ = miniredis.NewMiniRedis() }\n"
+            "func TestTLSListener(t *testing.T) { _, _ = tls.Listen(\"tcp\", \"127.0.0.1:0\", nil) }\n"
+            "func TestEmbeddedPG(t *testing.T) { _ = embeddedpostgres.NewDatabase() }\n"
+            "func TestDeepHelperChain(t *testing.T) { hop1() }\n",
+            encoding="utf-8",
+        )
+        detected = detect_go_loopback_tests(go_wt)
+        self.assertEqual(
+            detected,
+            [
+                "TestDeepHelperChain",
+                "TestEmbeddedPG",
+                "TestNewMiniRedis",
+                "TestRedisSearchCache",
+                "TestTLSListener",
+            ],
+        )
+        filtered = filter_builder_checks_for_sandbox(
+            ["go test -short ./..."],
+            go_wt,
+            sandbox_mode="workspace-write",
+            builder_network_access=False,
+        )
+        self.assertTrue(filtered["rewritten"])
+        self.assertIn("TestRedisSearchCache", filtered["deferred_tests"])
+        self.assertIn("TestRedisSearchCache", filtered["checks"][0])
+
+        # 2) Dependency manifest detection from PLAN.md target_files
+        self.assertEqual(
+            detect_plan_dependency_manifests(
+                ["go.mod", "./services/api/go.mod", "go.sum", "package.json", "Cargo.toml", "pyproject.toml", "requirements-dev.txt", "README.md"]
+            ),
+            ["go.mod", "services/api/go.mod", "package.json", "Cargo.toml", "pyproject.toml", "requirements-dev.txt"],
+        )
+
+        # 3) End-to-end Round 0 prompt injects offline dependency notice when go.mod is in Target Files
+        repo = _create_python_repo(self.tmp_path / "offline_manifest_repo")
+        rec_file = self.tmp_path / "offline_manifest_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Offline manifest guidance", repo_path=repo)["task"]["task_id"]
+        plan_with_manifest = (
+            PLAN_PY.replace("## Target Files\n- `calc.py`", "## Target Files\n- `go.mod`\n- `calc.py`")
+            + "\n## Builder Checks\n- `python3 -m unittest discover -v`\n"
+        )
+        self.orch.save_plan(tid, plan_with_manifest)
+        res = self.orch.execute_round(tid)
+        self.assertTrue(res["ok"])
+        rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
+        self.assertIn("OFFLINE SANDBOX DEPENDENCY NOTICE", rec["prompt"])
+        self.assertIn("`go.mod`", rec["prompt"])
+        self.assertIn("Do NOT attempt network downloads", rec["prompt"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
