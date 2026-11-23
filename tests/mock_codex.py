@@ -126,6 +126,67 @@ def main() -> int:
             encoding="utf-8",
         )
         summary = "Finished cleanly while streaming active events."
+    elif scenario == "active_past_soft_deadline":
+        # Streams active progress every 0.25s for ~2.0s so a 1s soft deadline extends via active grace and finishes cleanly
+        for i in range(8):
+            emit(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"Active work step {i + 1}"},
+                }
+            )
+            time.sleep(0.25)
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Finished cleanly after active wall-clock soft-grace extension."
+    elif scenario == "active_runaway_forever":
+        # Continuously streams events without finishing so max_active_extensions hard ceiling is verified
+        for i in range(60):
+            emit(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"Runaway step {i + 1}"},
+                }
+            )
+            time.sleep(0.2)
+        return 0
+    elif scenario == "multi_turn_usage":
+        # Emits an intermediate cumulative total_token_usage event followed by final turn.completed
+        emit(
+            {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 500,
+                        "cached_input_tokens": 100,
+                        "output_tokens": 120,
+                        "total_tokens": 620,
+                    }
+                },
+            }
+        )
+        emit(
+            {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1240,
+                        "cached_input_tokens": 420,
+                        "output_tokens": 310,
+                        "total_tokens": 1550,
+                    }
+                },
+            }
+        )
+        (wt / "calc.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+            "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+            encoding="utf-8",
+        )
+        summary = "Emitted cumulative streaming token_count events."
     elif scenario == "dotfiles_success":
         (wt / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
         (wt / ".env.example").write_text("PORT=8080\n", encoding="utf-8")
@@ -259,17 +320,20 @@ def main() -> int:
     else:
         summary = f"Unknown scenario {scenario}"
 
-    emit(
-        {
-            "type": "turn.completed",
-            "usage": {
-                "input_tokens": 1240,
-                "cached_input_tokens": 420,
-                "output_tokens": 310,
-                "total_tokens": 1550,
-            },
-        }
-    )
+    if scenario != "multi_turn_usage":
+        emit(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 1240,
+                    "cached_input_tokens": 420,
+                    "output_tokens": 310,
+                    "total_tokens": 1550,
+                },
+            }
+        )
+    else:
+        emit({"type": "turn.completed"})
 
     result_obj = {
         "status": "ready_for_verify" if scenario == "ready_for_verify" else "completed",

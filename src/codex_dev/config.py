@@ -17,6 +17,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "codex_timeout_sec": 600,
     "codex_idle_timeout_sec": 300,
     "codex_post_turn_grace_sec": 4,
+    "codex_active_grace_sec": 300,
+    "codex_active_grace_window_sec": 60,
+    "codex_max_active_extensions": 2,
     "codex_timeout_by_effort": {
         "low": 600,
         "medium": 600,

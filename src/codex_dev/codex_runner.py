@@ -118,6 +118,9 @@ class CodexRunOutcome:
     stderr_tail: str
     attempt: int = 1
     timeout_reason: str | None = None
+    active_extensions_used: int = 0
+    effective_timeout_sec: int | None = None
+    estimated_token_usage: dict[str, Any] | None = None
 
 
 def build_codex_prompt(
@@ -194,12 +197,22 @@ def build_codex_prompt(
 def _extract_usage(obj: dict[str, Any]) -> dict[str, Any] | None:
     """Extract normalized token usage from Codex JSONL event payloads when available."""
     usage = obj.get("usage")
+    cumulative = False
     if not isinstance(usage, dict):
-        # Some events nest usage under turn or response
-        for key in ("turn", "response", "result", "metrics"):
+        # Some events nest usage under turn/response/result/metrics/info
+        for key in ("turn", "response", "result", "metrics", "info", "payload"):
             nested = obj.get(key)
-            if isinstance(nested, dict) and isinstance(nested.get("usage"), dict):
+            if not isinstance(nested, dict):
+                continue
+            if isinstance(nested.get("usage"), dict):
                 usage = nested["usage"]
+                break
+            if isinstance(nested.get("last_token_usage"), dict):
+                usage = nested["last_token_usage"]
+                break
+            if isinstance(nested.get("total_token_usage"), dict):
+                usage = nested["total_token_usage"]
+                cumulative = True
                 break
     if not isinstance(usage, dict):
         return None
@@ -220,7 +233,50 @@ def _extract_usage(obj: dict[str, Any]) -> dict[str, Any] | None:
         "output_tokens": out_i,
         "total_tokens": total_i,
         "source": "codex_jsonl",
+        "cumulative": cumulative,
     }
+
+
+def _accumulate_attempt_usage(
+    current: dict[str, Any] | None,
+    event_usage: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Update per-attempt usage totals and return (new_attempt_total, delta_for_task_total)."""
+    clean_ev = {
+        "input_tokens": int(event_usage.get("input_tokens", 0)),
+        "cached_input_tokens": int(event_usage.get("cached_input_tokens", 0)),
+        "output_tokens": int(event_usage.get("output_tokens", 0)),
+        "total_tokens": int(event_usage.get("total_tokens", 0)),
+        "source": event_usage.get("source") or "codex_jsonl",
+    }
+    if current is None:
+        return dict(clean_ev), dict(clean_ev)
+
+    if event_usage.get("cumulative"):
+        delta = {
+            "input_tokens": max(0, clean_ev["input_tokens"] - int(current.get("input_tokens", 0))),
+            "cached_input_tokens": max(0, clean_ev["cached_input_tokens"] - int(current.get("cached_input_tokens", 0))),
+            "output_tokens": max(0, clean_ev["output_tokens"] - int(current.get("output_tokens", 0))),
+            "total_tokens": max(0, clean_ev["total_tokens"] - int(current.get("total_tokens", 0))),
+            "source": clean_ev["source"],
+        }
+        updated = {
+            "input_tokens": max(int(current.get("input_tokens", 0)), clean_ev["input_tokens"]),
+            "cached_input_tokens": max(int(current.get("cached_input_tokens", 0)), clean_ev["cached_input_tokens"]),
+            "output_tokens": max(int(current.get("output_tokens", 0)), clean_ev["output_tokens"]),
+            "total_tokens": max(int(current.get("total_tokens", 0)), clean_ev["total_tokens"]),
+            "source": clean_ev["source"],
+        }
+        return updated, delta
+
+    updated = {
+        "input_tokens": int(current.get("input_tokens", 0)) + clean_ev["input_tokens"],
+        "cached_input_tokens": int(current.get("cached_input_tokens", 0)) + clean_ev["cached_input_tokens"],
+        "output_tokens": int(current.get("output_tokens", 0)) + clean_ev["output_tokens"],
+        "total_tokens": int(current.get("total_tokens", 0)) + clean_ev["total_tokens"],
+        "source": clean_ev["source"],
+    }
+    return updated, clean_ev
 
 
 def _summarize_jsonl_event(ev: dict[str, Any]) -> tuple[str, str] | None:
@@ -363,6 +419,9 @@ def run_codex_exec(
     attempt: int = 1,
     idle_timeout_sec: int = 0,
     post_turn_grace_sec: float = 4.0,
+    active_grace_sec: int = 0,
+    active_grace_window_sec: int = 60,
+    max_active_extensions: int = 2,
     builder_env: dict[str, str] | None = None,
     builder_add_dirs: list[str] | None = None,
     builder_isolation: str = "strict",
@@ -559,8 +618,16 @@ def run_codex_exec(
     graceful_post_turn_exit = False
     turn_completed_seen = False
     events_seen = 0
+    streamed_chars = 0
     latest_usage: dict[str, Any] | None = None
     last_error_msg: str | None = None
+    active_extensions_used = 0
+    effective_timeout_sec = max(1, int(timeout_sec))
+    eff_grace_sec = max(0, int(active_grace_sec))
+    eff_max_ext = max(0, int(max_active_extensions))
+    eff_grace_window = max(0.0, float(active_grace_window_sec))
+    if idle_timeout_sec > 0:
+        eff_grace_window = min(eff_grace_window, float(idle_timeout_sec) * 0.5)
 
     def _mark_turn_completed() -> None:
         nonlocal turn_completed_seen
@@ -573,6 +640,7 @@ def run_codex_exec(
 
     def _watchdog() -> None:
         nonlocal timed_out, timeout_reason, cancelled, graceful_post_turn_exit
+        nonlocal active_extensions_used, effective_timeout_sec
         deadline = start_ts + max(1, timeout_sec)
         ready_to_exit_ts: float | None = None
         while proc.poll() is None:
@@ -589,16 +657,47 @@ def run_codex_exec(
                     graceful_post_turn_exit = True
                     _terminate_process_group(proc)
                     return
-            if now >= deadline:
-                timed_out = True
-                timeout_reason = "wall_clock"
-                _terminate_process_group(proc)
-                return
-            if idle_timeout_sec > 0 and (now - _get_last_activity()) >= idle_timeout_sec:
+            idle_elapsed = now - _get_last_activity()
+            if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
                 timed_out = True
                 timeout_reason = "idle"
                 _terminate_process_group(proc)
                 return
+            if now >= deadline:
+                if (
+                    eff_grace_sec > 0
+                    and eff_max_ext > 0
+                    and active_extensions_used < eff_max_ext
+                    and idle_elapsed <= eff_grace_window
+                ):
+                    active_extensions_used += 1
+                    deadline = now + eff_grace_sec
+                    effective_timeout_sec += eff_grace_sec
+                    store.append_event(
+                        task_id,
+                        phase="execute",
+                        agent="Orchestrator (Watchdog)",
+                        event_type="codex_timeout_extended",
+                        message=(
+                            f"Codex CLI still actively streaming (last event {idle_elapsed:.1f}s ago); "
+                            f"extended wall-clock deadline by +{eff_grace_sec}s "
+                            f"(extension {active_extensions_used}/{eff_max_ext}, new limit {effective_timeout_sec}s)."
+                        ),
+                        details={
+                            "round": repair_round,
+                            "attempt": attempt,
+                            "extension": active_extensions_used,
+                            "max_extensions": eff_max_ext,
+                            "added_sec": eff_grace_sec,
+                            "effective_timeout_sec": effective_timeout_sec,
+                            "idle_since_sec": round(idle_elapsed, 1),
+                        },
+                    )
+                else:
+                    timed_out = True
+                    timeout_reason = "wall_clock"
+                    _terminate_process_group(proc)
+                    return
             time.sleep(0.2)
 
     watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
@@ -611,6 +710,7 @@ def run_codex_exec(
                     _touch_activity()
                     log_fh.write(raw_line)
                     log_fh.flush()
+                    streamed_chars += len(raw_line)
                     stripped = raw_line.strip()
                     if not stripped:
                         continue
@@ -624,9 +724,11 @@ def run_codex_exec(
 
                     usage = _extract_usage(ev)
                     if usage:
-                        latest_usage = usage
-                        if on_token_usage:
-                            on_token_usage(usage)
+                        latest_usage, delta_usage = _accumulate_attempt_usage(latest_usage, usage)
+                        if on_token_usage and any(
+                            delta_usage.get(k, 0) > 0 for k in ("input_tokens", "output_tokens", "total_tokens")
+                        ):
+                            on_token_usage(delta_usage)
 
                     if ev.get("type") == "turn.completed":
                         _mark_turn_completed()
@@ -701,6 +803,19 @@ def run_codex_exec(
                 "post_turn_grace_sec": post_turn_grace_sec,
             },
         )
+    estimated_usage: dict[str, Any] | None = None
+    if latest_usage is None and (events_seen > 0 or streamed_chars > 0):
+        est_in = max(1, len(prompt) // 4)
+        est_out = max(1, streamed_chars // 4)
+        estimated_usage = {
+            "input_tokens": est_in,
+            "cached_input_tokens": 0,
+            "output_tokens": est_out,
+            "total_tokens": est_in + est_out,
+            "estimated": True,
+            "source": "char_estimate",
+        }
+
     result_doc = {
         "round": repair_round,
         "attempt": attempt,
@@ -709,11 +824,14 @@ def run_codex_exec(
         "timed_out": timed_out,
         "timeout_reason": timeout_reason,
         "timeout_sec": timeout_sec,
+        "effective_timeout_sec": effective_timeout_sec,
+        "active_extensions_used": active_extensions_used,
         "idle_timeout_sec": idle_timeout_sec,
         "graceful_post_turn_exit": graceful_post_turn_exit,
         "cancelled": cancelled,
         "duration_sec": duration,
         "token_usage": latest_usage,
+        "estimated_token_usage": estimated_usage,
         "raw_jsonl_path": str(raw_jsonl_path),
         "result_file_path": str(result_file_path),
         "codex_result": structured_result,
@@ -737,6 +855,9 @@ def run_codex_exec(
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
             attempt=attempt,
+            active_extensions_used=active_extensions_used,
+            effective_timeout_sec=effective_timeout_sec,
+            estimated_token_usage=estimated_usage,
         )
 
     if timed_out:
@@ -746,9 +867,10 @@ def run_codex_exec(
                 f"(idle timeout; total elapsed {duration}s)."
             )
         else:
+            ext_note = f", {active_extensions_used} active extension(s)" if active_extensions_used else ""
             err_msg = (
-                f"Codex execution timed out after {timeout_sec}s total limit "
-                f"(last event {idle_since}s ago)."
+                f"Codex execution timed out after {effective_timeout_sec}s total limit "
+                f"(last event {idle_since}s ago{ext_note})."
             )
         return CodexRunOutcome(
             ok=False,
@@ -766,6 +888,9 @@ def run_codex_exec(
             stderr_tail=stderr_tail,
             attempt=attempt,
             timeout_reason=timeout_reason,
+            active_extensions_used=active_extensions_used,
+            effective_timeout_sec=effective_timeout_sec,
+            estimated_token_usage=estimated_usage,
         )
 
     if effective_exit_code != 0:
@@ -785,6 +910,9 @@ def run_codex_exec(
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
             attempt=attempt,
+            active_extensions_used=active_extensions_used,
+            effective_timeout_sec=effective_timeout_sec,
+            estimated_token_usage=estimated_usage,
         )
 
     if structured_result and structured_result.get("status") in ("failed", "blocked"):
@@ -804,6 +932,9 @@ def run_codex_exec(
             result_file_path=str(result_file_path),
             stderr_tail=stderr_tail,
             attempt=attempt,
+            active_extensions_used=active_extensions_used,
+            effective_timeout_sec=effective_timeout_sec,
+            estimated_token_usage=estimated_usage,
         )
 
     return CodexRunOutcome(
@@ -821,4 +952,7 @@ def run_codex_exec(
         result_file_path=str(result_file_path),
         stderr_tail=stderr_tail,
         attempt=attempt,
+        active_extensions_used=active_extensions_used,
+        effective_timeout_sec=effective_timeout_sec,
+        estimated_token_usage=estimated_usage,
     )

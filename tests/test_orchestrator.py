@@ -1165,6 +1165,60 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         with self.assertRaises(InvalidModelError):
             self.orch.execute_round(tid_locked, override_effort="max")
 
+    def test_25_active_wall_clock_grace_and_token_accounting(self) -> None:
+        cfg_path = self.orch.home_dir / "config.json"
+        cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg_data["codex_active_grace_sec"] = 2
+        cfg_data["codex_active_grace_window_sec"] = 2
+        cfg_data["codex_max_active_extensions"] = 2
+        cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+
+        repo = _create_python_repo(self.tmp_path / "active_grace_repo")
+
+        # 1) Active Builder streaming past soft deadline gets extended and completes cleanly with exact tokens
+        os.environ["MOCK_CODEX_SCENARIO"] = "active_past_soft_deadline"
+        tid = self.orch.init_task(name="Active soft grace", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        res = self.orch.execute_round(tid, timeout_sec=1, idle_timeout_sec=5)
+        self.assertTrue(res["ok"])
+        self.assertGreaterEqual(res["outcome"]["active_extensions_used"], 1)
+        self.assertGreater(res["outcome"]["effective_timeout_sec"], 1)
+        self.assertEqual(res["state"]["token_usage"]["total_tokens"], 1550)
+        self.assertEqual(res["state"]["token_usage"]["rounds_with_usage"], 1)
+        self.assertEqual(res["state"]["token_usage"]["rounds_missing_usage"], 0)
+        self.assertFalse(res["state"]["token_usage"]["partial"])
+        ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
+        self.assertIn("codex_timeout_extended", ev_types)
+
+        # 2) Runaway active stream hits hard ceiling after max_active_extensions and records partial/estimated missing usage
+        cfg_data["codex_active_grace_sec"] = 1
+        cfg_data["codex_max_active_extensions"] = 1
+        cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+        os.environ["MOCK_CODEX_SCENARIO"] = "active_runaway_forever"
+        tid2 = self.orch.init_task(name="Runaway hard ceiling", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid2, PLAN_PY)
+        res2 = self.orch.execute_round(tid2, timeout_sec=1, idle_timeout_sec=5)
+        self.assertFalse(res2["ok"])
+        self.assertEqual(res2["outcome"]["timeout_reason"], "wall_clock")
+        self.assertEqual(res2["outcome"]["active_extensions_used"], 1)
+        tok2 = res2["state"]["token_usage"]
+        self.assertTrue(tok2["partial"])
+        self.assertEqual(tok2["rounds_missing_usage"], 1)
+        self.assertEqual(tok2["total_tokens"], 0)
+        self.assertGreater(tok2["estimated_missing_tokens"], 0)
+        self.assertIsNotNone(res2["state"]["model_history"][0].get("estimated_token_usage"))
+
+        # 3) Cumulative token_count events do not double-count exact totals
+        os.environ["MOCK_CODEX_SCENARIO"] = "multi_turn_usage"
+        tid3 = self.orch.init_task(name="Cumulative token count", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid3, PLAN_PY)
+        res3 = self.orch.execute_round(tid3)
+        self.assertTrue(res3["ok"])
+        self.assertEqual(res3["outcome"]["token_usage"]["total_tokens"], 1550)
+        self.assertEqual(res3["state"]["token_usage"]["total_tokens"], 1550)
+        self.assertEqual(res3["state"]["token_usage"]["input_tokens"], 1240)
+        self.assertEqual(res3["state"]["token_usage"]["output_tokens"], 310)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

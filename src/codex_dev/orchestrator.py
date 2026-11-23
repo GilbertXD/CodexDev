@@ -69,22 +69,66 @@ def _pid_alive(pid: int) -> bool:
 def _merge_token_totals(current: dict[str, Any] | None, delta: dict[str, Any] | None) -> dict[str, Any] | None:
     if delta is None:
         return current
-    base = current or {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "available": True,
-        "source": delta.get("source") or "codex_jsonl",
-    }
-    return {
-        "input_tokens": int(base.get("input_tokens", 0)) + int(delta.get("input_tokens", 0)),
-        "cached_input_tokens": int(base.get("cached_input_tokens", 0)) + int(delta.get("cached_input_tokens", 0)),
-        "output_tokens": int(base.get("output_tokens", 0)) + int(delta.get("output_tokens", 0)),
-        "total_tokens": int(base.get("total_tokens", 0)) + int(delta.get("total_tokens", 0)),
-        "available": True,
-        "source": delta.get("source") or base.get("source") or "codex_jsonl",
-    }
+    base = dict(
+        current
+        or {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "available": True,
+            "source": delta.get("source") or "codex_jsonl",
+            "rounds_with_usage": 0,
+            "rounds_missing_usage": 0,
+            "partial": False,
+            "estimated_missing_tokens": 0,
+        }
+    )
+    base.update(
+        {
+            "input_tokens": int(base.get("input_tokens", 0)) + int(delta.get("input_tokens", 0)),
+            "cached_input_tokens": int(base.get("cached_input_tokens", 0)) + int(delta.get("cached_input_tokens", 0)),
+            "output_tokens": int(base.get("output_tokens", 0)) + int(delta.get("output_tokens", 0)),
+            "total_tokens": int(base.get("total_tokens", 0)) + int(delta.get("total_tokens", 0)),
+            "available": True,
+            "source": delta.get("source") or base.get("source") or "codex_jsonl",
+        }
+    )
+    return base
+
+
+def _record_attempt_token_accounting(
+    current: dict[str, Any] | None,
+    *,
+    exact_usage: dict[str, Any] | None,
+    estimated_usage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Finalize per-attempt token completeness metadata without polluting exact totals."""
+    tok = dict(
+        current
+        or {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "available": False,
+            "source": None,
+        }
+    )
+    tok.setdefault("rounds_with_usage", 0)
+    tok.setdefault("rounds_missing_usage", 0)
+    tok.setdefault("partial", False)
+    tok.setdefault("estimated_missing_tokens", 0)
+    if exact_usage is not None:
+        tok["rounds_with_usage"] = int(tok["rounds_with_usage"]) + 1
+    else:
+        tok["rounds_missing_usage"] = int(tok["rounds_missing_usage"]) + 1
+        tok["partial"] = True
+        if isinstance(estimated_usage, dict):
+            tok["estimated_missing_tokens"] = int(tok["estimated_missing_tokens"]) + int(
+                estimated_usage.get("total_tokens", 0)
+            )
+    return tok
 
 
 def _format_verification_feedback(report: dict[str, Any], repair_round: int) -> str:
@@ -252,6 +296,10 @@ class Orchestrator:
                 "total_tokens": 0,
                 "available": False,
                 "source": None,
+                "rounds_with_usage": 0,
+                "rounds_missing_usage": 0,
+                "partial": False,
+                "estimated_missing_tokens": 0,
             },
             "verification_summary": None,
             "diff_stats": {
@@ -499,11 +547,21 @@ class Orchestrator:
                 attempt=attempt_num,
                 idle_timeout_sec=eff_idle_timeout,
                 post_turn_grace_sec=float(cfg.get("codex_post_turn_grace_sec", 4)),
+                active_grace_sec=int(cfg.get("codex_active_grace_sec", 300)),
+                active_grace_window_sec=int(cfg.get("codex_active_grace_window_sec", 60)),
+                max_active_extensions=int(cfg.get("codex_max_active_extensions", 2)),
                 builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
                 builder_add_dirs=cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
                 builder_isolation=str(cfg.get("builder_isolation") or "strict"),
                 builder_network_access=builder_network_access,
                 on_token_usage=_live_usage_cb,
+            )
+
+            # Finalize per-attempt token completeness metadata
+            state["token_usage"] = _record_attempt_token_accounting(
+                state.get("token_usage"),
+                exact_usage=outcome.token_usage,
+                estimated_usage=outcome.estimated_token_usage,
             )
 
             # Record model history entry with final round token usage
@@ -514,6 +572,8 @@ class Orchestrator:
                 token_usage=outcome.token_usage,
             )
             history_entry["attempt"] = attempt_num
+            if outcome.token_usage is None and outcome.estimated_token_usage is not None:
+                history_entry["estimated_token_usage"] = outcome.estimated_token_usage
             state.setdefault("model_history", []).append(history_entry)
 
             # Update diff stats snapshot after Builder run
