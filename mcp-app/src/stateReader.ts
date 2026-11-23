@@ -210,7 +210,7 @@ export function formatPlainTextSummary(snapshot: MonitorSnapshot): string {
     `Task ID: ${snapshot.selected_task_id}`,
     `Status: ${String(s.status)} | Phase: ${String(s.current_phase)} | Agent: ${String(s.current_agent)}`,
     `Branch: ${String(t.branch || "-")} | Worktree: ${String(t.worktree_path || "-")}`,
-    `Builder Model: ${String(mp.current_model || "-")} (${String(mp.mode || "auto")}${mp.locked ? ", locked" : ""})`,
+    `Builder Model: ${String(mp.current_model || "-")} (${String(mp.mode || "auto")}${mp.locked ? ", locked" : ""}${mp.current_reasoning_effort || mp.reasoning_effort ? `, effort=${String(mp.current_reasoning_effort || mp.reasoning_effort)}${mp.effort_locked ? " locked" : ""}` : ""})`,
     `Repair Round: ${String(s.repair_round ?? 0)} / ${String(s.max_repair_rounds ?? 3)}`,
     `Diff: ${String(diff.files_changed_count ?? 0)} files (+${String(diff.total_insertions ?? 0)} / -${String(diff.total_deletions ?? 0)})`,
   ];

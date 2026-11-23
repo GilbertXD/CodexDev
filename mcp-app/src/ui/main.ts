@@ -242,8 +242,11 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
   const builderModel = String(mp.current_model || "—");
   const modelMode = String(mp.mode || "auto").toUpperCase();
   const modelLocked = Boolean(mp.locked);
+  const builderEffort = String(mp.current_reasoning_effort || mp.reasoning_effort || "").toUpperCase();
+  const effortLocked = Boolean(mp.effort_locked);
   const reviewerModel = String(mp.reviewer_model || "inherit_session");
-  const modelModeLabel = modelLocked ? `${modelMode} · LOCKED` : modelMode;
+  const effortLabel = builderEffort ? ` · ${builderEffort}${effortLocked ? " LOCKED" : ""}` : "";
+  const modelModeLabel = `${modelLocked ? `${modelMode} · LOCKED` : modelMode}${effortLabel}`;
 
   const modelHistory = Array.isArray(state.model_history) ? (state.model_history as Array<Record<string, unknown>>) : [];
   const latestBuilderEntry = [...modelHistory].reverse().find((m) => m.role === "builder");

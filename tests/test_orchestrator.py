@@ -1046,6 +1046,125 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         ver_raw = (self.orch.store.task_dir(tid) / "verification.json").read_text(encoding="utf-8")
         self.assertNotIn("s3cr3t-value", ver_raw)
 
+    def test_24_reasoning_effort_routing_escalation_clamping_and_disallowed_ban(self) -> None:
+        from codex_dev.models import resolve_task_model_policy, select_model_for_round
+
+        # 1) max and ultra are permanently banned on explicit requests
+        repo = _create_python_repo(self.tmp_path / "effort_repo")
+        for forbidden in ("max", "ultra", "MAX", "Ultra"):
+            with self.assertRaises(InvalidModelError):
+                self.orch.init_task(name="Banned effort", repo_path=repo, reasoning_effort=forbidden)
+
+        # 2) Complexity -> reasoning_effort auto-routing (low/medium/high)
+        t_low = self.orch.init_task(name="Low tier", repo_path=repo, complexity="low")["state"]["model_policy"]
+        t_med = self.orch.init_task(name="Med tier", repo_path=repo, complexity="medium")["state"]["model_policy"]
+        t_high = self.orch.init_task(name="High tier", repo_path=repo, complexity="high")["state"]["model_policy"]
+        self.assertEqual(t_low["current_reasoning_effort"], "low")
+        self.assertEqual(t_med["current_reasoning_effort"], "medium")
+        self.assertEqual(t_high["current_reasoning_effort"], "high")
+        self.assertEqual(t_high["max_auto_effort"], "xhigh")
+
+        # 3) Legacy config with max/ultra in auto mode clamps cleanly to <= xhigh and never leaks max/ultra
+        cfg = {
+            "model_policy": {
+                "mode": "auto",
+                "authorized_models": ["gpt-6-luna", "gpt-6.2-sol"],
+                "complexity_routing": {"low": "gpt-6-luna", "medium": "gpt-6-luna", "high": "gpt-6.2-sol"},
+                "escalation_order": ["gpt-6-luna", "gpt-6.2-sol"],
+                "reasoning_effort": "ultra",
+                "effort_by_complexity": {"low": "low", "medium": "medium", "high": "max"},
+                "max_auto_effort": "ultra",
+            }
+        }
+        cached = [
+            {"slug": "gpt-6-luna", "supported_efforts": ["low", "medium", "high"]},
+            {"slug": "gpt-6.2-sol", "supported_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]},
+        ]
+        pol_high = resolve_task_model_policy(cfg, complexity="high", cached_models=cached)
+        self.assertEqual(pol_high["current_reasoning_effort"], "xhigh")
+        self.assertEqual(pol_high["max_auto_effort"], "xhigh")
+
+        # Capability clamping when model only supports up to high
+        pol_clamped = resolve_task_model_policy(
+            {
+                "model_policy": {
+                    "mode": "auto",
+                    "authorized_models": ["gpt-6-luna"],
+                    "complexity_routing": {"high": "gpt-6-luna"},
+                    "effort_by_complexity": {"high": "xhigh"},
+                    "max_auto_effort": "xhigh",
+                }
+            },
+            complexity="high",
+            cached_models=cached,
+        )
+        self.assertEqual(pol_clamped["current_reasoning_effort"], "high")
+
+        # 4) Dynamic escalation: test_failure escalates effort high -> xhigh (and stops at xhigh, never max);
+        #    targeted review_failure retains current effort!
+        pol = resolve_task_model_policy(
+            {
+                "model_policy": {
+                    "mode": "auto",
+                    "authorized_models": ["gpt-6.2-sol"],
+                    "complexity_routing": {"high": "gpt-6.2-sol"},
+                    "escalation_order": ["gpt-6.2-sol"],
+                    "effort_by_complexity": {"high": "high"},
+                    "max_auto_effort": "xhigh",
+                }
+            },
+            complexity="high",
+            cached_models=cached,
+        )
+        sel_review = select_model_for_round(
+            pol,
+            cfg,
+            repair_round=1,
+            escalate=True,
+            failure_category="review_failure",
+            cached_models=cached,
+        )
+        self.assertEqual(sel_review.reasoning_effort, "high")
+        self.assertIsNone(sel_review.effort_escalated_from)
+
+        sel_test = select_model_for_round(
+            pol,
+            cfg,
+            repair_round=1,
+            escalate=True,
+            failure_category="test_failure",
+            cached_models=cached,
+        )
+        self.assertEqual(sel_test.reasoning_effort, "xhigh")
+        self.assertEqual(sel_test.effort_escalated_from, "high")
+
+        # Already at xhigh -> never escalates to max/ultra
+        pol["current_reasoning_effort"] = "xhigh"
+        sel_cap = select_model_for_round(
+            pol,
+            cfg,
+            repair_round=2,
+            escalate=True,
+            failure_category="test_failure",
+            cached_models=cached,
+        )
+        self.assertEqual(sel_cap.reasoning_effort, "xhigh")
+        self.assertIsNone(sel_cap.effort_escalated_from)
+
+        # 5) Locked effort prevents escalation and per-round override, and per-round max/ultra is rejected
+        tid_locked = self.orch.init_task(
+            name="Locked effort",
+            repo_path=repo,
+            complexity="high",
+            reasoning_effort="medium",
+            lock_effort=True,
+        )["task"]["task_id"]
+        self.orch.save_plan(tid_locked, PLAN_PY)
+        with self.assertRaises(InvalidModelError):
+            self.orch.execute_round(tid_locked, override_effort="high")
+        with self.assertRaises(InvalidModelError):
+            self.orch.execute_round(tid_locked, override_effort="max")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

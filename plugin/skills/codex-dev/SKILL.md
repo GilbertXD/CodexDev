@@ -14,12 +14,14 @@ You are the **Architect** and **Reviewer**. **Codex CLI** is the **Builder**. Th
 ## Operating Rules
 
 1. **Orchestrator binary**: Run `codex-dev` (installed at `~/.local/bin/codex-dev`, fallback `python3 ~/.codex-dev/runtime/run_cli.py`). See [references/workflow-cli.md](./references/workflow-cli.md) for full flags.
-2. **Model policy (strict)**:
-   - Run `codex-dev models --repo <repo>` first to inspect the user's verified `authorized_models` and policy (`auto` vs `manual`).
-   - **Auto mode (default)**: Select complexity (`low` | `medium` | `high`) based on scope and risk; the orchestrator picks from `authorized_models` and may escalate within `authorized_models` on repair rounds.
-   - **Manual / Locked mode**: If the user specifies a Codex model (e.g. "use `gpt-6.2-sol`" or "lock `gpt-6-luna`"), pass `--model-mode manual --model <id> --lock-model`.
+2. **Model & reasoning effort policy (strict)**:
+   - Run `codex-dev models --repo <repo>` first to inspect the user's verified `authorized_models`, `complexity_routing`, `effort_by_complexity`, and policy (`auto` vs `manual`).
+   - **Auto mode (default)**: Select complexity (`low` | `medium` | `high`) based on scope and risk; the orchestrator routes both `(model, reasoning_effort)` (`low→low`, `medium→medium`, `high→high`) and may escalate within `authorized_models` / `effort_escalation_order` (up to `max_auto_effort`, default `xhigh`) on failed verification/execution rounds while retaining effort on targeted review-fix rounds.
+   - **Manual / Locked mode**: If the user specifies a Codex model or effort (e.g. "use `gpt-6.2-sol`" or "use effort `high`"), pass `--model-mode manual --model <id> --lock-model` and/or `--reasoning-effort <low|medium|high|xhigh> --lock-effort`.
+   - `max` and `ultra` reasoning efforts are **permanently disabled** and rejected by the orchestrator.
    - Never guess or substitute unverified model IDs. If a requested model is unauthorized, report the verified list and ask the user.
    - **Reviewer model**: Inherits your current Antigravity session model by default.
+   - **Builder isolation**: By default (`builder_isolation: "strict"`), Codex CLI runs with an isolated `CODEX_HOME` (`~/.codex-dev/codex_home`) and disables personal plugins, skills, apps, hooks, and desktop notifications without modifying `~/.codex/`.
 3. **Read-only Monitor**: After initializing a task, call the `open_monitor` tool on the `codex-dev_monitor` MCP server (when connected) to open the **Codex Dev Monitor** side panel (`aux_pane`) so the user can observe live progress.
 4. **Git safety**:
    - Work always happens in an isolated Git worktree (`~/.codex-dev/worktrees/<task_id>`). Never overwrite uncommitted changes in the user's main repository.
@@ -56,7 +58,8 @@ Write a clear, testable `PLAN.md` containing:
 - `## Target Files` (explicit expected files/directories in backticks; whenever a task introduces new runtime CLI/binary dependencies, config keys, environment variables, or database migrations/schema changes, audit and include deployment/config files such as `Dockerfile`, `docker-compose.yml`, `.env.example`, config templates, and existing migration/rollback integration tests up front to avoid avoidable `unexpected_files` audit warnings or regression failures)
 - `## Implementation Plan`
 - `## Acceptance Criteria` (concrete, verifiable checklist items)
-- `## Verification Commands` (project-specific test, build, lint, typecheck commands in backticks)
+- `## Builder Checks` (optional sandbox-safe offline checks for Codex CLI to run inside `workspace-write`, e.g., `go vet ./...`, `go test -short ./...`, `make build`)
+- `## Verification Commands` (authoritative host-level test, build, lint, typecheck commands in backticks; if a task requires task-specific env vars such as live smoke test targets, pass repeatable `--verify-env KEY=VALUE` on `init`/`plan`/`verify`/`run-round`)
 - `## Out of Scope`
 
 Lock the contract via stdin so the user never copies anything:

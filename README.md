@@ -51,17 +51,19 @@ Because `codex-dev` stores global task metadata, isolated Git worktrees, and run
 1. Add `codex-dev` to **Command Allowlist** (so orchestrator subcommands run cleanly without repeated prompts).
 2. Add a **Permission Grant / Non-Workspace File Access** allowance for `~/.codex-dev` (preserving strict workspace sandboxing everywhere else).
 
-### Dependency Preparation & Environment Overrides
+### Builder Isolation, Sandbox Decoupling & Environment Overrides
 
-Codex CLI runs inside `-s workspace-write` (offline) with an automatic writable `GOCACHE`/`GOTMPDIR` under `~/.codex-dev/tasks/<task_id>/` (passed via `--add-dir` and `shell_environment_policy.set`) so Go `vet`/`build`/`test` work inside the sandbox without polluting the worktree.
+- **Strict Builder Isolation (`builder_isolation: "strict"`, default)**: Before launching `codex exec`, the Orchestrator provisions an isolated `CODEX_HOME` at `~/.codex-dev/codex_home` (symlinking only `auth.json` and `models_cache.json` read-only from `~/.codex/`) and passes `--disable plugins --disable apps --disable hooks --disable skill_search -c notify=[]`. Your personal `~/.codex/` plugins, skills, `AGENTS.md`, and MCP servers remain untouched and never interfere with deterministic workflow runs. Set `"builder_isolation": "inherit"` if you explicitly want to inherit host Codex settings.
+- **Sandbox Checks vs Host Verify**: You may declare optional sandbox-safe `## Builder Checks` in `PLAN.md` (e.g., `go vet ./...`, `go test -short ./...`, `make build`) while keeping full integration/loopback checks in `## Verification Commands` for the Host Orchestrator. When sandbox checks pass, Builder reports `status: "ready_for_verify"` instead of `partial`. For trusted repositories needing loopback/local DB tests inside `workspace-write`, set `repo_overrides.<repo>.builder.network_access: true` (passes `-c sandbox_workspace_write.network_access=true` while keeping filesystem writes confined to the worktree).
+- **Post-Turn Grace Period (`codex_post_turn_grace_sec: 4`)**: After `turn.completed` arrives and the structured output file is saved on disk, lingering Codex CLI teardown processes are gracefully terminated after the short grace window instead of waiting 20–30s.
+- **Writable Go Cache & Non-Sandbox Prepare**: Codex CLI receives automatic writable `GOCACHE`/`GOTMPDIR` under `~/.codex-dev/tasks/<task_id>/` via `--add-dir`. When dependencies change (e.g., `go.mod`), the Orchestrator runs a non-sandbox **Prepare** step (`auto_go_mod_tidy: true` by default) before independent verification without burning a repair round on preparation failures.
 
-When a task introduces new third-party dependencies (for example, modifying `go.mod`), the Orchestrator runs a non-sandbox **Prepare** step (`auto_go_mod_tidy: true` by default, or explicit `prepare.commands` / `## Prepare Commands` / `--prepare-cmd`) before independent verification. Prepare failures transition to `BLOCKED` (`dependency_prepare_failure`) without consuming a code-repair round.
-
-You can pass environment overrides (such as `GOPROXY` or `TEST_DATABASE_URL`) to Verify and Prepare stages via:
+You can pass environment overrides (such as `GOPROXY`, `TEST_DATABASE_URL`, or task-specific live test targets) to Verify and Prepare stages via:
 1. Global `~/.codex-dev/config.json` (`verify.env` / `prepare.env`)
 2. Shared repository `<repo>/.codex-dev.json`
-3. Non-intrusive per-repository `repo_overrides` inside `~/.codex-dev/config.json` (keyed by repository path, keeping local secrets/DSNs out of the target Git repo)
-4. Machine-local `<repo>/.codex-dev.local.json` (highest file precedence)
+3. Non-intrusive per-repository `repo_overrides` inside `~/.codex-dev/config.json`
+4. Machine-local `<repo>/.codex-dev.local.json`
+5. Task/command-level `--verify-env KEY=VALUE` on `init`, `plan`, `verify`, or `run-round` (highest precedence; persisted per task, with only key names recorded in `verification.json`)
 
 ```json
 {
@@ -135,12 +137,22 @@ Edit `~/.codex-dev/config.json` (global) or `<repo>/.codex-dev.json` (repository
       "high": "gpt-6.2-sol"
     },
     "escalation_order": ["gpt-6-luna", "gpt-6.2-sol"],
-    "reasoning_effort": "low"
+    "reasoning_effort": "medium",
+    "effort_locked": false,
+    "effort_by_complexity": {
+      "low": "low",
+      "medium": "medium",
+      "high": "high"
+    },
+    "effort_escalation_order": ["low", "medium", "high", "xhigh"],
+    "max_auto_effort": "xhigh"
   }
 }
 ```
 
 - Only models listed in `authorized_models` are accepted; unverified or unauthorized model IDs are rejected immediately.
+- Allowed reasoning efforts are `low`, `medium`, `high`, and `xhigh`. `max` and `ultra` are **permanently disabled** and rejected if requested.
+- On repair rounds after test/execution failures, `auto` mode escalates model first and then `reasoning_effort` up to `max_auto_effort` (clamped to the model's `supported_efforts`). On targeted `review_failure` rounds, current effort is retained unless overridden.
 - Reviewer inherits the active Antigravity session model by default.
 
 ## Verification & Testing

@@ -22,8 +22,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "medium": 600,
         "high": 1200,
         "xhigh": 1500,
-        "max": 1800,
-        "ultra": 1800,
     },
     "codex_timeout_by_complexity": {
         "low": 600,
@@ -62,6 +60,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "escalation_order": [],
         "reasoning_effort": "medium",
+        "effort_locked": False,
+        "effort_by_complexity": {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        },
+        "effort_escalation_order": ["low", "medium", "high", "xhigh"],
+        "max_auto_effort": "xhigh",
     },
     "reviewer": {
         "mode": "inherit_session",
@@ -150,7 +156,9 @@ def read_local_codex_hints(codex_home: Path | None = None) -> dict[str, Any]:
                             "supported_efforts": [
                                 r.get("effort")
                                 for r in item.get("supported_reasoning_levels", [])
-                                if isinstance(r, dict) and isinstance(r.get("effort"), str)
+                                if isinstance(r, dict)
+                                and isinstance(r.get("effort"), str)
+                                and r.get("effort").strip().lower() in ("low", "medium", "high", "xhigh")
                             ],
                         }
                     )
@@ -329,7 +337,11 @@ def ensure_default_global_config(
         cfg["model_policy"]["escalation_order"] = esc
 
     if hints["default_effort"]:
-        cfg["model_policy"]["reasoning_effort"] = hints["default_effort"]
+        raw_effort = str(hints["default_effort"]).strip().lower()
+        if raw_effort in ("low", "medium", "high", "xhigh"):
+            cfg["model_policy"]["reasoning_effort"] = raw_effort
+        elif raw_effort in ("max", "ultra"):
+            cfg["model_policy"]["reasoning_effort"] = "high"
     if hints.get("codex_cli_path"):
         cfg["codex_binary"] = hints["codex_cli_path"]
 

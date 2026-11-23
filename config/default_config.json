@@ -10,9 +10,7 @@
     "low": 600,
     "medium": 600,
     "high": 1200,
-    "xhigh": 1500,
-    "max": 1800,
-    "ultra": 1800
+    "xhigh": 1500
   },
   "codex_timeout_by_complexity": {
     "low": 600,
@@ -50,7 +48,15 @@
       "high": null
     },
     "escalation_order": [],
-    "reasoning_effort": "medium"
+    "reasoning_effort": "medium",
+    "effort_locked": false,
+    "effort_by_complexity": {
+      "low": "low",
+      "medium": "medium",
+      "high": "high"
+    },
+    "effort_escalation_order": ["low", "medium", "high", "xhigh"],
+    "max_auto_effort": "xhigh"
   },
   "reviewer": {
     "mode": "inherit_session",

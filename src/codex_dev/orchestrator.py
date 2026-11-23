@@ -21,6 +21,8 @@ from .contract import (
     verify_contract_integrity,
 )
 from .models import (
+    ALLOWED_EFFORTS,
+    DISALLOWED_EFFORTS,
     InvalidModelError,
     make_model_history_entry,
     resolve_task_model_policy,
@@ -138,6 +140,12 @@ class Orchestrator:
             "complexity_routing": policy.get("complexity_routing") or {},
             "escalation_order": policy.get("escalation_order") or [],
             "reasoning_effort": policy.get("reasoning_effort", "medium"),
+            "effort_locked": bool(policy.get("effort_locked", False)),
+            "effort_by_complexity": policy.get("effort_by_complexity") or {},
+            "effort_escalation_order": policy.get("effort_escalation_order") or list(ALLOWED_EFFORTS),
+            "max_auto_effort": policy.get("max_auto_effort", "xhigh"),
+            "allowed_efforts": list(ALLOWED_EFFORTS),
+            "disallowed_efforts": sorted(DISALLOWED_EFFORTS),
             "reviewer": cfg.get("reviewer") or {},
             "local_codex_default": hints.get("default_model"),
             "local_codex_cached_models": hints.get("cached_models") or [],
@@ -154,6 +162,7 @@ class Orchestrator:
         lock_model: bool | None = None,
         complexity: str = "medium",
         reasoning_effort: str | None = None,
+        lock_effort: bool | None = None,
         max_repair_rounds: int | None = None,
         verify_commands: list[str] | None = None,
         verify_env: list[str] | dict[str, str] | None = None,
@@ -166,8 +175,9 @@ class Orchestrator:
         repo_root = Path(repo_info["repo_root"])
         cfg = load_config(repo_path=repo_root, home_dir=self.home_dir)
         parsed_verify_env = parse_env_assignments(verify_env)
+        hints = read_local_codex_hints()
 
-        # Validate model policy BEFORE creating worktree so invalid models fail cleanly
+        # Validate model & effort policy BEFORE creating worktree so invalid models/efforts fail cleanly
         task_model_policy = resolve_task_model_policy(
             cfg,
             mode=model_mode,
@@ -175,6 +185,8 @@ class Orchestrator:
             locked=lock_model,
             complexity=complexity,
             reasoning_effort=reasoning_effort,
+            lock_effort=lock_effort,
+            cached_models=hints.get("cached_models") or None,
         )
 
         tid = task_id or generate_task_id()
@@ -355,6 +367,7 @@ class Orchestrator:
         task_id: str | None,
         *,
         override_model: str | None = None,
+        override_effort: str | None = None,
         timeout_sec: int | None = None,
         idle_timeout_sec: int | None = None,
         escalate_model: bool = False,
@@ -367,6 +380,7 @@ class Orchestrator:
             meta = self.store.load_task_meta(tid)
             state = self.store.load_state(tid)
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
+            hints = read_local_codex_hints()
 
             # Verify immutable plan contract before invoking Builder
             contract_check = verify_contract_integrity(tdir)
@@ -384,6 +398,7 @@ class Orchestrator:
 
             repair_round = int(state.get("repair_round", 0))
             should_escalate = escalate_model or (repair_round > 0 and state["model_policy"].get("mode") == "auto")
+            prev_failure_category = state.get("failure_category")
 
             try:
                 selection = select_model_for_round(
@@ -391,7 +406,10 @@ class Orchestrator:
                     cfg,
                     repair_round=repair_round,
                     override_model=override_model,
+                    override_effort=override_effort,
                     escalate=should_escalate,
+                    failure_category=prev_failure_category,
+                    cached_models=hints.get("cached_models") or None,
                 )
             except InvalidModelError as exc:
                 self.store.transition(
@@ -406,6 +424,9 @@ class Orchestrator:
                 raise
 
             state["model_policy"]["current_model"] = selection.model
+            if selection.reasoning_effort:
+                state["model_policy"]["current_reasoning_effort"] = selection.reasoning_effort
+                state["model_policy"]["reasoning_effort"] = selection.reasoning_effort
             attempt_num = int(state.get("execution_attempts", 0)) + 1
             state["execution_attempts"] = attempt_num
 
@@ -416,15 +437,18 @@ class Orchestrator:
                 event_type="builder_started",
                 message=(
                     f"Handing off to Codex CLI Builder (round {repair_round}, attempt {attempt_num}, "
-                    f"model={selection.model}): {selection.reason}"
+                    f"model={selection.model}, effort={selection.reasoning_effort or 'default'}): {selection.reason}"
                 ),
                 details={
                     "round": repair_round,
                     "attempt": attempt_num,
                     "model": selection.model,
+                    "reasoning_effort": selection.reasoning_effort,
                     "mode": selection.mode,
                     "locked": selection.locked,
+                    "effort_locked": selection.effort_locked,
                     "escalated_from": selection.escalated_from,
+                    "effort_escalated_from": selection.effort_escalated_from,
                 },
             )
 
@@ -886,6 +910,7 @@ class Orchestrator:
         task_id: str | None,
         *,
         override_model: str | None = None,
+        override_effort: str | None = None,
         codex_timeout_sec: int | None = None,
         codex_idle_timeout_sec: int | None = None,
         verify_commands: list[str] | None = None,
@@ -899,6 +924,7 @@ class Orchestrator:
         exec_res = self.execute_round(
             task_id,
             override_model=override_model,
+            override_effort=override_effort,
             timeout_sec=codex_timeout_sec,
             idle_timeout_sec=codex_idle_timeout_sec,
         )

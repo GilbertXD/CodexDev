@@ -59,7 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--lock-model", action="store_true", default=None, help="Lock model across all repair rounds.")
     ip.add_argument("--no-lock-model", dest="lock_model", action="store_false", help="Allow authorized model escalation.")
     ip.add_argument("--complexity", choices=["low", "medium", "high"], default="medium", help="Task complexity tier.")
-    ip.add_argument("--reasoning-effort", default=None, help="Codex reasoning effort override (low/medium/high).")
+    ip.add_argument("--reasoning-effort", default=None, help="Codex reasoning effort override (low/medium/high/xhigh; max/ultra disabled).")
+    ip.add_argument("--lock-effort", action="store_true", default=None, help="Lock reasoning effort across all repair rounds.")
+    ip.add_argument("--no-lock-effort", dest="lock_effort", action="store_false", help="Allow automatic reasoning effort escalation.")
     ip.add_argument("--max-repair-rounds", type=int, default=None, help="Maximum automatic repair rounds (default: 3).")
     ip.add_argument("--verify-cmd", action="append", default=None, help="Explicit independent verification command (repeatable).")
     ip.add_argument("--verify-env", action="append", default=None, help="Task-level verification env override KEY=VALUE (repeatable).")
@@ -81,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     ep = sub.add_parser("execute", help="Run Codex CLI Builder for the current round.")
     ep.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     ep.add_argument("--model", default=None, help="Optional per-round authorized model override (if unlocked).")
+    ep.add_argument("--reasoning-effort", default=None, help="Optional per-round reasoning effort override (low/medium/high/xhigh; max/ultra disabled).")
     ep.add_argument("--timeout", type=int, default=None, help="Total Codex execution timeout in seconds.")
     ep.add_argument("--idle-timeout", type=int, default=None, help="Idle no-event timeout in seconds (0 disables).")
     ep.add_argument("--escalate", action="store_true", help="Request authorized model escalation if unlocked.")
@@ -109,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     rrp = sub.add_parser("run-round", help="Execute Builder, prepare dependencies outside sandbox, and verify.")
     rrp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     rrp.add_argument("--model", default=None, help="Optional per-round authorized model override.")
+    rrp.add_argument("--reasoning-effort", default=None, help="Optional per-round reasoning effort override (low/medium/high/xhigh; max/ultra disabled).")
     rrp.add_argument("--codex-timeout", type=int, default=None, help="Total Codex timeout in seconds.")
     rrp.add_argument("--codex-idle-timeout", type=int, default=None, help="Codex idle no-event timeout in seconds (0 disables).")
     rrp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command.")
@@ -186,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 lock_model=args.lock_model,
                 complexity=args.complexity,
                 reasoning_effort=args.reasoning_effort,
+                lock_effort=args.lock_effort,
                 max_repair_rounds=args.max_repair_rounds,
                 verify_commands=args.verify_cmd,
                 verify_env=args.verify_env,
@@ -213,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             res = orch.execute_round(
                 args.task_id,
                 override_model=args.model,
+                override_effort=args.reasoning_effort,
                 timeout_sec=args.timeout,
                 idle_timeout_sec=args.idle_timeout,
                 escalate_model=args.escalate,
@@ -246,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             res = orch.run_round(
                 args.task_id,
                 override_model=args.model,
+                override_effort=args.reasoning_effort,
                 codex_timeout_sec=args.codex_timeout,
                 codex_idle_timeout_sec=args.codex_idle_timeout,
                 verify_commands=args.verify_cmd,
