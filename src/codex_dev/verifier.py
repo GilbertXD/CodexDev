@@ -129,8 +129,38 @@ def _normalize_cmd_list(cmds: list[Any], default_kind: str = "custom", prefix: s
     return out
 
 
-def build_stage_env(config: dict[str, Any], stage: str) -> dict[str, str]:
-    """Build host subprocess environment with configured verify/prepare overrides (e.g. GOPROXY)."""
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_env_assignments(items: list[str] | dict[str, str] | None) -> dict[str, str]:
+    """Parse repeatable KEY=VALUE CLI flags or a dict into a validated env dict."""
+    if not items:
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(items, dict):
+        for k, v in items.items():
+            key = str(k).strip()
+            if not _ENV_KEY_RE.match(key):
+                raise ValueError(f"Invalid environment variable name: {k!r}")
+            out[key] = "" if v is None else str(v)
+        return out
+    for raw in items:
+        if not isinstance(raw, str) or "=" not in raw:
+            raise ValueError(f"Invalid --verify-env assignment {raw!r}; expected KEY=VALUE.")
+        key_raw, val = raw.split("=", 1)
+        key = key_raw.strip()
+        if not _ENV_KEY_RE.match(key):
+            raise ValueError(f"Invalid environment variable name in --verify-env: {key_raw!r}")
+        out[key] = val
+    return out
+
+
+def build_stage_env(
+    config: dict[str, Any],
+    stage: str,
+    explicit_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build host subprocess environment with configured and task-level verify/prepare overrides."""
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     verify_env = (config.get("verify") or {}).get("env")
     if isinstance(verify_env, dict):
@@ -143,6 +173,10 @@ def build_stage_env(config: dict[str, Any], stage: str) -> dict[str, str]:
             for k, v in prep_env.items():
                 if isinstance(k, str) and k.strip() and v is not None:
                     env[k.strip()] = str(v)
+    if isinstance(explicit_env, dict):
+        for k, v in explicit_env.items():
+            if isinstance(k, str) and k.strip() and v is not None:
+                env[k.strip()] = str(v)
     return env
 
 
@@ -201,6 +235,7 @@ def run_dependency_prepare(
     base_commit: str,
     config: dict[str, Any],
     explicit_commands: list[str] | None = None,
+    explicit_env: dict[str, str] | None = None,
     timeout_sec: int | None = None,
 ) -> dict[str, Any]:
     """Run non-sandbox dependency preparation commands outside Codex's offline sandbox."""
@@ -216,7 +251,7 @@ def run_dependency_prepare(
 
     prep_cfg = config.get("prepare") or {}
     eff_timeout = int(timeout_sec if timeout_sec is not None else prep_cfg.get("timeout_sec", 180))
-    stage_env = build_stage_env(config, "prepare")
+    stage_env = build_stage_env(config, "prepare", explicit_env=explicit_env)
 
     results: list[dict[str, Any]] = []
     passed_count = 0
@@ -518,6 +553,7 @@ def run_independent_verification(
     base_commit: str,
     config: dict[str, Any],
     explicit_commands: list[str] | None = None,
+    explicit_env: dict[str, str] | None = None,
     timeout_sec: int = 300,
     extra_allowed_files: list[str] | None = None,
     prepare_report: dict[str, Any] | None = None,
@@ -541,7 +577,7 @@ def run_independent_verification(
     skipped_tests_total = 0
     all_skipped_tests: list[str] = []
     seen_skipped_tests: set[str] = set()
-    verify_env = build_stage_env(config, "verify")
+    verify_env = build_stage_env(config, "verify", explicit_env=explicit_env)
 
     for item in commands:
         cmd_str = item["command"]
@@ -639,6 +675,7 @@ def run_independent_verification(
         "verified_at": utc_now(),
         "passed": overall_passed,
         "command_source": source,
+        "explicit_env_keys": sorted(explicit_env.keys()) if isinstance(explicit_env, dict) else [],
         "commands_total": len(checks),
         "commands_passed": passed_count,
         "commands_failed": failed_count,

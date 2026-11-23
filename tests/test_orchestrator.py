@@ -1000,6 +1000,52 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         events = self.orch.store.read_events(tid)
         self.assertIn("codex_graceful_exit", [e.get("type") for e in events])
 
+    def test_23_task_level_verify_env_injection_and_precedence(self) -> None:
+        from codex_dev.verifier import parse_env_assignments
+
+        with self.assertRaises(ValueError):
+            parse_env_assignments(["NO_EQUALS_SIGN"])
+        with self.assertRaises(ValueError):
+            parse_env_assignments(["123BAD=value"])
+
+        repo = _create_python_repo(self.tmp_path / "verify_env_repo")
+        (repo / ".codex-dev.local.json").write_text(
+            json.dumps({"verify": {"env": {"FROM_CONFIG": "cfg-val", "OVERRIDE_ME": "from-config"}}}),
+            encoding="utf-8",
+        )
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(
+            name="Task verify env",
+            repo_path=repo,
+            verify_env=["LIVE_TARGET=/tmp/sample-repo", "OVERRIDE_ME=from-init"],
+        )["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY, verify_env=["PLAN_SECRET=s3cr3t-value"])
+
+        check_cmd = (
+            "python3 -c \"import hashlib, os; "
+            "assert os.environ.get('FROM_CONFIG') == 'cfg-val'; "
+            "assert os.environ.get('LIVE_TARGET') == '/tmp/sample-repo'; "
+            "assert hashlib.sha256(os.environ.get('PLAN_SECRET', '').encode()).hexdigest() == "
+            "'1f3fa74b1208842aad0b685f0cd06053a9e84f0eb7f2c1c94c96ea25cb13cd77'; "
+            "assert os.environ.get('OVERRIDE_ME') == 'from-call'; "
+            "print('ALL_ENV_OK')\""
+        )
+        res = self.orch.run_round(
+            tid,
+            verify_commands=[check_cmd, "python3 -m unittest discover -v"],
+            verify_env=["OVERRIDE_ME=from-call"],
+        )
+        self.assertTrue(res["ok"])
+        report = res["verification"]["report"]
+        self.assertEqual(report["skipped_tests_total"], 0)
+        self.assertEqual(
+            report["explicit_env_keys"],
+            ["LIVE_TARGET", "OVERRIDE_ME", "PLAN_SECRET"],
+        )
+        # verification.json records only env key names, never raw secret values
+        ver_raw = (self.orch.store.task_dir(tid) / "verification.json").read_text(encoding="utf-8")
+        self.assertNotIn("s3cr3t-value", ver_raw)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--reasoning-effort", default=None, help="Codex reasoning effort override (low/medium/high).")
     ip.add_argument("--max-repair-rounds", type=int, default=None, help="Maximum automatic repair rounds (default: 3).")
     ip.add_argument("--verify-cmd", action="append", default=None, help="Explicit independent verification command (repeatable).")
+    ip.add_argument("--verify-env", action="append", default=None, help="Task-level verification env override KEY=VALUE (repeatable).")
     ip.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox dependency preparation command (repeatable).")
     ip.add_argument("--task-id", default=None, help="Optional custom task ID.")
 
@@ -71,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--plan-file", default=None, help="Path to PLAN.md file (or '-' for stdin).")
     pp.add_argument("--plan-text", default=None, help="Inline PLAN.md markdown text.")
     pp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command (repeatable).")
+    pp.add_argument("--verify-env", action="append", default=None, help="Task-level verification env override KEY=VALUE (repeatable).")
     pp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox prepare command (repeatable).")
     pp.add_argument("--target-file", action="append", default=None, help="Expected file/dir scope (repeatable).")
     pp.add_argument("--allow-replan", action="store_true", help="Explicitly replace existing plan contract.")
@@ -93,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     vp = sub.add_parser("verify", help="Run non-sandbox dependency preparation and independent verification.")
     vp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     vp.add_argument("--verify-cmd", action="append", default=None, help="Override verification commands.")
+    vp.add_argument("--verify-env", action="append", default=None, help="Per-run verification env override KEY=VALUE (repeatable).")
     vp.add_argument("--prepare-cmd", action="append", default=None, help="Override non-sandbox prepare commands.")
     vp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
     vp.add_argument("--timeout", type=int, default=None, help="Per-command timeout in seconds.")
@@ -109,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     rrp.add_argument("--codex-timeout", type=int, default=None, help="Total Codex timeout in seconds.")
     rrp.add_argument("--codex-idle-timeout", type=int, default=None, help="Codex idle no-event timeout in seconds (0 disables).")
     rrp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command.")
+    rrp.add_argument("--verify-env", action="append", default=None, help="Per-run verification env override KEY=VALUE (repeatable).")
     rrp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox prepare command.")
     rrp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
     rrp.add_argument("--verify-timeout", type=int, default=None, help="Verification command timeout in seconds.")
@@ -184,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 reasoning_effort=args.reasoning_effort,
                 max_repair_rounds=args.max_repair_rounds,
                 verify_commands=args.verify_cmd,
+                verify_env=args.verify_env,
                 prepare_commands=args.prepare_cmd,
                 task_id=args.task_id,
             )
@@ -196,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.task_id,
                 plan_text,
                 verify_commands=args.verify_cmd,
+                verify_env=args.verify_env,
                 prepare_commands=args.prepare_cmd,
                 target_files=args.target_file,
                 allow_replan=args.allow_replan,
@@ -227,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             res = orch.verify_task(
                 args.task_id,
                 verify_commands=args.verify_cmd,
+                verify_env=args.verify_env,
                 prepare_commands=args.prepare_cmd,
                 skip_prepare=args.skip_prepare,
                 timeout_sec=args.timeout,
@@ -242,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_timeout_sec=args.codex_timeout,
                 codex_idle_timeout_sec=args.codex_idle_timeout,
                 verify_commands=args.verify_cmd,
+                verify_env=args.verify_env,
                 prepare_commands=args.prepare_cmd,
                 skip_prepare=args.skip_prepare,
                 verify_timeout_sec=args.verify_timeout,

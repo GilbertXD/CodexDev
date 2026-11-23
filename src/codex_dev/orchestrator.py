@@ -45,7 +45,7 @@ from .state import (
     read_json,
     utc_now,
 )
-from .verifier import run_dependency_prepare, run_independent_verification
+from .verifier import parse_env_assignments, run_dependency_prepare, run_independent_verification
 from .worktree import (
     commit_worktree_changes,
     create_isolated_worktree,
@@ -156,6 +156,7 @@ class Orchestrator:
         reasoning_effort: str | None = None,
         max_repair_rounds: int | None = None,
         verify_commands: list[str] | None = None,
+        verify_env: list[str] | dict[str, str] | None = None,
         prepare_commands: list[str] | None = None,
         task_id: str | None = None,
     ) -> dict[str, Any]:
@@ -164,6 +165,7 @@ class Orchestrator:
         repo_info = inspect_repo(repo_path)
         repo_root = Path(repo_info["repo_root"])
         cfg = load_config(repo_path=repo_root, home_dir=self.home_dir)
+        parsed_verify_env = parse_env_assignments(verify_env)
 
         # Validate model policy BEFORE creating worktree so invalid models fail cleanly
         task_model_policy = resolve_task_model_policy(
@@ -206,6 +208,7 @@ class Orchestrator:
             "branch": wt_info["branch"],
             "worktree_path": wt_info["worktree_path"],
             "explicit_verify_commands": verify_commands or [],
+            "explicit_verify_env": parsed_verify_env,
             "explicit_prepare_commands": prepare_commands or [],
             "created_at": created_at,
         }
@@ -297,6 +300,7 @@ class Orchestrator:
         plan_text: str,
         *,
         verify_commands: list[str] | None = None,
+        verify_env: list[str] | dict[str, str] | None = None,
         prepare_commands: list[str] | None = None,
         target_files: list[str] | None = None,
         allow_replan: bool = False,
@@ -304,9 +308,15 @@ class Orchestrator:
         """Save immutable PLAN.md contract and transition CREATED -> PLANNED."""
         tid = self.resolve_task_id(task_id)
         tdir = self.store.task_dir(tid)
+        parsed_verify_env = parse_env_assignments(verify_env)
         with self.store.acquire_write_lock(tid):
             state = self.store.load_state(tid)
             meta = self.store.load_task_meta(tid)
+            if parsed_verify_env:
+                merged_env = dict(meta.get("explicit_verify_env") or {})
+                merged_env.update(parsed_verify_env)
+                meta["explicit_verify_env"] = merged_env
+                atomic_write_json(tdir / "task.json", meta)
             effective_verify = verify_commands if verify_commands is not None else (meta.get("explicit_verify_commands") or None)
             effective_prepare = prepare_commands if prepare_commands is not None else (meta.get("explicit_prepare_commands") or None)
             contract = save_immutable_contract(
@@ -611,6 +621,7 @@ class Orchestrator:
         task_id: str | None,
         *,
         verify_commands: list[str] | None = None,
+        verify_env: list[str] | dict[str, str] | None = None,
         prepare_commands: list[str] | None = None,
         skip_prepare: bool = False,
         timeout_sec: int | None = None,
@@ -619,11 +630,13 @@ class Orchestrator:
         """Run non-sandbox dependency preparation (if needed) and independent verification."""
         tid = self.resolve_task_id(task_id)
         tdir = self.store.task_dir(tid)
+        call_verify_env = parse_env_assignments(verify_env)
 
         with self.store.acquire_write_lock(tid):
             meta = self.store.load_task_meta(tid)
             state = self.store.load_state(tid)
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
+            effective_verify_env = {**dict(meta.get("explicit_verify_env") or {}), **call_verify_env}
 
             if state["status"] != STATE_VERIFYING:
                 allow_from_failed = False
@@ -692,6 +705,7 @@ class Orchestrator:
                     base_commit=meta["base_commit"],
                     config=cfg,
                     explicit_commands=explicit_prep,
+                    explicit_env=effective_verify_env or None,
                 )
                 if prep_report["ran"]:
                     extra_allowed_files = list(prep_report.get("generated_allowed_files") or [])
@@ -753,6 +767,7 @@ class Orchestrator:
                 base_commit=meta["base_commit"],
                 config=cfg,
                 explicit_commands=explicit_cmds,
+                explicit_env=effective_verify_env or None,
                 timeout_sec=eff_timeout,
                 extra_allowed_files=extra_allowed_files,
                 prepare_report=prep_report if (prep_report and prep_report["ran"]) else None,
@@ -874,11 +889,13 @@ class Orchestrator:
         codex_timeout_sec: int | None = None,
         codex_idle_timeout_sec: int | None = None,
         verify_commands: list[str] | None = None,
+        verify_env: list[str] | dict[str, str] | None = None,
         prepare_commands: list[str] | None = None,
         skip_prepare: bool = False,
         verify_timeout_sec: int | None = None,
     ) -> dict[str, Any]:
         """Run one deterministic Execute -> Prepare -> Verify cycle."""
+        parsed_verify_env = parse_env_assignments(verify_env)
         exec_res = self.execute_round(
             task_id,
             override_model=override_model,
@@ -899,6 +916,7 @@ class Orchestrator:
         ver_res = self.verify_task(
             exec_res["task_id"],
             verify_commands=verify_commands,
+            verify_env=parsed_verify_env or None,
             prepare_commands=prepare_commands,
             skip_prepare=skip_prepare,
             timeout_sec=verify_timeout_sec,
