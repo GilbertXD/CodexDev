@@ -135,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicitly acknowledge a justified verification/diff-audit warning (repeatable).",
     )
+    rvp.add_argument(
+        "--evidence",
+        action="append",
+        default=None,
+        help="Attach verification or visual/browser acceptance evidence (path or summary, repeatable).",
+    )
     rvp.add_argument("--reviewer-model", default=None, help="Explicit reviewer model (only used if routing_supported=true).")
 
     # status
@@ -281,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                 feedback=fb,
                 issues=args.issue,
                 acknowledged_warnings=args.ack_warning,
+                evidence=args.evidence,
                 reviewer_model=args.reviewer_model,
             )
             _print_json(res)

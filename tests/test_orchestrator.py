@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -1990,6 +1992,50 @@ Add standalone documents with migration, API, and integration tests.
             {"target_files": ["web/package.json", "package.json"]},
         )
         self.assertEqual(audit["unexpected_files"], [])
+
+    def test_36_review_structured_evidence_persistence_and_cli(self) -> None:
+        from codex_dev.cli import main as cli_main
+
+        repo = _create_python_repo(self.tmp_path / "evidence_repo")
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Review evidence test", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+        res = self.orch.run_round(tid)
+        self.assertEqual(res["next_action"], "review_required")
+
+        ev1 = "Browser E2E @ http://localhost:5173: 10/10 flows passed, 0 console errors."
+        ev2 = "/tmp/screenshots/final_home.png"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main(
+                [
+                    "--home",
+                    str(self.home_dir),
+                    "review",
+                    "--task-id",
+                    tid,
+                    "--verdict",
+                    "approve",
+                    "--summary",
+                    "Approved with browser E2E evidence.",
+                    "--evidence",
+                    ev1,
+                    "--evidence",
+                    ev2,
+                ]
+            )
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["review"]["evidence"], [ev1, ev2])
+        self.assertEqual(payload["state"]["latest_review"]["evidence"], [ev1, ev2])
+
+        reviews_doc = json.loads((self.orch.store.task_dir(tid) / "reviews.json").read_text(encoding="utf-8"))
+        self.assertEqual(reviews_doc[-1]["evidence"], [ev1, ev2])
+        exec_log = (self.orch.store.task_dir(tid) / "EXECUTION_LOG.md").read_text(encoding="utf-8")
+        self.assertIn("- Evidence:", exec_log)
+        self.assertIn(ev1, exec_log)
+        self.assertIn(ev2, exec_log)
 
 
 if __name__ == "__main__":

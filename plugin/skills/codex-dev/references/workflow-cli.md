@@ -16,7 +16,7 @@ All commands output structured JSON to stdout.
 - `codex-dev execute [--task-id <id>] [--model <id>] [--reasoning-effort low|medium|high|xhigh] [--timeout <sec>] [--idle-timeout <sec>] [--escalate]` — Enforce pre-Builder readiness gate and run Codex CLI inside the immutable `workspace-write` sandbox (includes max 1 non-escalating environment retry on permission/dependency/environment errors).
 - `codex-dev verify [--task-id <id>] [--verify-cmd <cmd>] [--verify-env KEY=VAL] [--prepare-cmd <cmd>] [--skip-prepare] [--timeout <sec>] [--from-failed]` — Run post-Builder dependency tidy (e.g. `go mod tidy`) and authoritative host-level independent verification.
 - `codex-dev run-round [--task-id <id>] [--model <id>] [--reasoning-effort low|medium|high|xhigh] [--codex-timeout <sec>] [--codex-idle-timeout <sec>] [--verify-cmd <cmd>] [--verify-env KEY=VAL] [--prepare-cmd <cmd>] [--skip-prepare] [--verify-timeout <sec>]` — Run full deterministic Pre-Prepare -> Execute -> Post-Tidy -> Verify cycle.
-- `codex-dev review [--task-id <id>] --verdict <approve|request_changes|block> --summary <text> [--issue <item>]... [--ack-warning <note>]... [--feedback <text>]`
+- `codex-dev review [--task-id <id>] --verdict <approve|request_changes|block> --summary <text> [--issue <item>]... [--ack-warning <note>]... [--evidence <path_or_note>]... [--feedback <text>]`
 
 ## Inspection, Control & Delivery
 

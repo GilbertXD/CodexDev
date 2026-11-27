@@ -1732,6 +1732,7 @@ class Orchestrator:
         feedback: str = "",
         issues: list[str] | None = None,
         acknowledged_warnings: list[str] | None = None,
+        evidence: list[str] | None = None,
         reviewer_model: str | None = None,
     ) -> dict[str, Any]:
         """Record Antigravity's semantic Code Review verdict and drive Completed/Revising/Blocked."""
@@ -1757,6 +1758,7 @@ class Orchestrator:
             repair_round = int(state.get("repair_round", 0))
             max_repairs = int(state.get("max_repair_rounds", 3))
             ack_list = [w.strip() for w in (acknowledged_warnings or []) if w.strip()]
+            evidence_list = [e.strip() for e in (evidence or []) if e.strip()]
 
             review_entry = {
                 "round": repair_round,
@@ -1764,6 +1766,7 @@ class Orchestrator:
                 "summary": summary.strip(),
                 "issues": [i.strip() for i in (issues or []) if i.strip()],
                 "acknowledged_warnings": ack_list,
+                "evidence": evidence_list,
                 "feedback": feedback.strip(),
                 "reviewer_model": eff_reviewer_model,
                 "timestamp": utc_now(),
@@ -1805,6 +1808,13 @@ class Orchestrator:
                     + "\n"
                     if ack_list
                     else ""
+                )
+                + (
+                    "- Evidence:\n"
+                    + "\n".join(f"  - {item}" for item in evidence_list)
+                    + "\n"
+                    if evidence_list
+                    else ""
                 ),
             )
 
@@ -1812,6 +1822,8 @@ class Orchestrator:
                 approve_details: dict[str, Any] = {"verdict": "approve", "round": repair_round}
                 if ack_list:
                     approve_details["acknowledged_warnings"] = ack_list
+                if evidence_list:
+                    approve_details["evidence"] = evidence_list
                 self.store.transition(
                     tid,
                     state,

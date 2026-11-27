@@ -101,7 +101,7 @@ When state is `REVIEWING`:
 4. Record the verdict:
    - Approve:
      ```bash
-     codex-dev review --task-id <task_id> --verdict approve --summary "<concise approval conclusion>" [--ack-warning "<justified audit warning note>"]
+     codex-dev review --task-id <task_id> --verdict approve --summary "<concise approval conclusion>" [--ack-warning "<justified audit warning note>"] [--evidence "<browser screenshot or verification note>"]
      ```
    - Request changes:
      ```bash
