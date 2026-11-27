@@ -53,7 +53,8 @@ _PYTEST_SUMMARY_RE = re.compile(r"(?:^=+[^\n]*?\b(\d+)\s+skipped\b[^\n]*?=+\s*$)
 _RUST_IGNORED_LINE_RE = re.compile(r"^\s*test\s+(\S+)\s+\.\.\.\s+ignored\s*$", re.MULTILINE)
 _RUST_SUMMARY_RE = re.compile(r"^test result:\s+\w+\.\s+\d+\s+passed;\s+\d+\s+failed;\s+(\d+)\s+ignored;", re.MULTILINE)
 _NODE_TEST_SKIP_SUMMARY_RE = re.compile(r"^#\s+skipped\s+(\d+)\s*$", re.MULTILINE)
-_JS_TESTS_SUMMARY_RE = re.compile(r"^\s*Tests:\s+[^\n]*?\b(\d+)\s+skipped\b", re.MULTILINE)
+_JS_TESTS_SUMMARY_RE = re.compile(r"^\s*Tests:?\s+[^\n]*?\b(\d+)\s+skipped\b", re.MULTILINE)
+_VITEST_SKIP_LINE_RE = re.compile(r"^\s*↓\s+(.+?)(?:\s+\[skipped\])?\s*$", re.MULTILINE)
 
 
 def detect_skipped_tests(stdout: str, stderr: str = "") -> dict[str, Any]:
@@ -96,6 +97,9 @@ def detect_skipped_tests(stdout: str, stderr: str = "") -> dict[str, Any]:
 
     node_summary = sum(int(m) for m in _NODE_TEST_SKIP_SUMMARY_RE.findall(combined))
     js_summary = sum(int(m) for m in _JS_TESTS_SUMMARY_RE.findall(combined))
+    vitest_skip_lines = _VITEST_SKIP_LINE_RE.findall(combined)
+    for m in vitest_skip_lines:
+        _add_name(m)
 
     total = (
         len(go_matches)
@@ -103,7 +107,7 @@ def detect_skipped_tests(stdout: str, stderr: str = "") -> dict[str, Any]:
         + max(len(pytest_lines), pytest_summary)
         + max(len(rust_lines), rust_summary)
         + node_summary
-        + js_summary
+        + max(js_summary, len(vitest_skip_lines))
     )
     total = max(total, len(names))
     return {"skipped_count": total, "skipped_tests": names[:25]}
@@ -139,6 +143,7 @@ _OBSERVABLE_TEST_SUMMARY_RES = (
     re.compile(r"^test result:\s+(?:ok|FAILED)\.", re.MULTILINE),
     re.compile(r"^#\s+tests\s+\d+\s*$", re.MULTILINE),
     re.compile(r"^\s*Tests:\s+.*\btotal\b", re.MULTILINE),
+    re.compile(r"^\s*Tests\s+\d+\s+(?:passed|failed|skipped|todo)\b[^\n]*\(\d+\)\s*$", re.MULTILINE),
     re.compile(r"(?:^=+[^\n]*?\b(?:passed|failed|skipped)\b[^\n]*?=+\s*$)|(?:^\s*\d+\s+(?:passed|failed|skipped)\b[^\n]*\bin\s+[\d.]+s)", re.MULTILINE),
     re.compile(r"^\s*---\s+(?:PASS|FAIL|SKIP):\s+\S+", re.MULTILINE),
 )
@@ -438,6 +443,12 @@ def _extract_test_names_from_file(path: Path) -> list[str]:
         return list(
             dict.fromkeys(
                 re.findall(r"#\[(?:[\w:]+::)?test(?:\([^\]]*\))?\]\s*(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(", text)
+            )
+        )
+    if suffix in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+        return list(
+            dict.fromkeys(
+                re.findall(r"""\b(?:it|test)(?:\.(?:only|skip|todo|concurrent))?\(\s*['"`]([^'"`\n]+)['"`]""", text)
             )
         )
     return []
@@ -1167,7 +1178,7 @@ def audit_diff_integrity(
     # 4. Out-of-scope file check if contract declared explicit target_files
     target_files = list((contract or {}).get("target_files") or [])
     if target_files:
-        # Automatically treat sibling go.sum as expected when go.mod is targeted or go mod tidy ran
+        # Automatically treat sibling lockfiles/checksums as expected when manifests are targeted
         for tf in list(target_files):
             if tf == "go.mod" and "go.sum" not in target_files:
                 target_files.append("go.sum")
@@ -1175,6 +1186,12 @@ def audit_diff_integrity(
                 sib = tf[:-len("go.mod")] + "go.sum"
                 if sib not in target_files:
                     target_files.append(sib)
+            elif tf == "package.json" or tf.endswith("/package.json"):
+                prefix = tf[:-len("package.json")]
+                for lock_name in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"):
+                    sib = prefix + lock_name
+                    if sib not in target_files:
+                        target_files.append(sib)
         if extra_allowed_files:
             for af in extra_allowed_files:
                 if af not in target_files:

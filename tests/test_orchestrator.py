@@ -1937,6 +1937,60 @@ Add standalone documents with migration, API, and integration tests.
         self.assertEqual(res_c["state"]["repair_round"], 0)
         self.assertEqual(res_c["environment_report"]["kind"], "permission_denied")
 
+    def test_35_vitest_skip_detection_ts_changed_test_guard_and_node_lockfiles(self) -> None:
+        from codex_dev.verifier import (
+            _has_observable_test_summary,
+            audit_diff_integrity,
+            detect_skipped_tests,
+            find_skipped_changed_tests,
+        )
+
+        # 1) Vitest passing summary is observable with zero skips (no false unobservable_skips warning)
+        vitest_pass = " Test Files  2 passed (2)\n      Tests  21 passed (21)\n"
+        self.assertTrue(_has_observable_test_summary(vitest_pass))
+        self.assertEqual(detect_skipped_tests(vitest_pass), {"skipped_count": 0, "skipped_tests": []})
+
+        # 2) Vitest skipped output extracts exact skipped test name and count
+        vitest_skip = (
+            " ✓ src/App.test.tsx (2 tests)\n"
+            " ↓ renders search scope [skipped]\n"
+            " Test Files  1 passed (1)\n"
+            "      Tests  1 passed | 1 skipped (2)\n"
+        )
+        self.assertTrue(_has_observable_test_summary(vitest_skip))
+        parsed = detect_skipped_tests(vitest_skip)
+        self.assertEqual(parsed["skipped_count"], 1)
+        self.assertEqual(parsed["skipped_tests"], ["renders search scope"])
+
+        # 3) Changed JS/TS test extraction catches skipped modified frontend tests
+        ts_wt = self.tmp_path / "ts_skip_wt"
+        (ts_wt / "web" / "src").mkdir(parents=True)
+        (ts_wt / "web" / "src" / "search.test.tsx").write_text(
+            "import { it } from 'vitest'\n"
+            "it.skip('renders search scope', () => {})\n"
+            "test('loads projects', () => {})\n",
+            encoding="utf-8",
+        )
+        matched, changed_files = find_skipped_changed_tests(
+            ts_wt,
+            ["web/src/search.test.tsx"],
+            parsed["skipped_tests"],
+        )
+        self.assertEqual(matched, ["renders search scope"])
+        self.assertEqual(changed_files, ["web/src/search.test.tsx"])
+
+        # 4) Node sibling lockfiles are automatically allowed when package.json is targeted
+        audit = audit_diff_integrity(
+            {
+                "all_changed_files": ["web/package.json", "web/package-lock.json", "package.json", "pnpm-lock.yaml"],
+                "modified": ["web/package.json", "web/package-lock.json", "package.json", "pnpm-lock.yaml"],
+                "deleted": [],
+                "full_diff": "",
+            },
+            {"target_files": ["web/package.json", "package.json"]},
+        )
+        self.assertEqual(audit["unexpected_files"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
