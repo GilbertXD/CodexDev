@@ -503,13 +503,19 @@ class TestCodexDevOrchestrator(unittest.TestCase):
             feedback_text=None,
             repair_round=0,
             worktree_path=Path("/tmp/wt"),
+            writable_dirs=["/tmp/wt", "/tmp/cache"],
+            builder_checks=["python3 -m unittest discover -v"],
+            builder_network_access=False,
         )
         self.assertIn("workspace-write", prompt)
-        self.assertIn("GOCACHE", prompt)
-        self.assertIn("127.0.0.1", prompt)
-        self.assertIn("Docker daemon", prompt)
-        self.assertIn("non-sandbox dependency preparation", prompt)
-        self.assertIn("independent verification", prompt)
+        self.assertIn("`/tmp/wt`, `/tmp/cache`", prompt)
+        self.assertIn("disabled (offline)", prompt)
+        self.assertIn("Prepared upstream", prompt)
+        self.assertIn("permission_denied", prompt)
+        self.assertIn("missing_dependency", prompt)
+        # Historical language/tool-specific sandbox prompt patches must be absent
+        for legacy_patch in ("docker info", "rm -f", "GOPROXY=off", "httptest.NewServer", "miniredis"):
+            self.assertNotIn(legacy_patch, prompt)
 
     def test_12_verify_from_failed_guarded_transition(self) -> None:
         repo = _create_python_repo(self.tmp_path)
@@ -630,19 +636,22 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertEqual(rr_ok["state"]["status"], STATE_REVIEWING)
         self.assertTrue((self.orch.store.task_dir(tid_ok) / "prepare.json").is_file())
 
-        # 14C: Failing prepare blocks task as dependency_prepare_failure WITHOUT burning a repair_round
+        # 14C: Failing pre-Builder prepare blocks task BEFORE starting Builder without burning a repair_round
         tid_fail = self.orch.init_task(
-            name="Prepare failure does not burn repair round",
+            name="Prepare failure does not start Builder or burn repair round",
             repo_path=repo,
             prepare_commands=['python3 -c "import sys; sys.stderr.write(\'proxy unreachable\\n\'); sys.exit(1)"'],
         )["task"]["task_id"]
         self.orch.save_plan(tid_fail, PLAN_PY)
         rr_fail = self.orch.run_round(tid_fail)
         self.assertFalse(rr_fail["ok"])
+        self.assertEqual(rr_fail["stage"], "prepare")
+        self.assertIsNone(rr_fail["execution"])
         self.assertEqual(rr_fail["next_action"], "blocked_dependency_prepare")
         self.assertEqual(rr_fail["state"]["status"], STATE_BLOCKED)
         self.assertEqual(rr_fail["state"]["failure_category"], "dependency_prepare_failure")
         self.assertEqual(rr_fail["state"]["repair_round"], 0)
+        self.assertEqual(rr_fail["state"]["execution_attempts"], 0)
 
     def test_15_diff_summary_only_omits_diff_body(self) -> None:
         repo = _create_python_repo(self.tmp_path)
@@ -858,8 +867,8 @@ class TestCodexDevOrchestrator(unittest.TestCase):
             repair_round=0,
             worktree_path=self.tmp_path,
         )
-        self.assertIn("Prefer running offline/unit package tests", prompt)
-        self.assertIn("docker info", prompt)
+        self.assertIn("workspace-write", prompt)
+        self.assertNotIn("docker info", prompt)
 
         repo = _create_python_repo(self.tmp_path / "benign_hang")
         os.environ["MOCK_CODEX_SCENARIO"] = "benign_stderr_hang"
@@ -1235,125 +1244,78 @@ class TestCodexDevOrchestrator(unittest.TestCase):
         self.assertEqual(res3["state"]["token_usage"]["input_tokens"], 1240)
         self.assertEqual(res3["state"]["token_usage"]["output_tokens"], 310)
 
-    def test_26_sandbox_builder_checks_stack_agnostic_loopback_filter(self) -> None:
-        from codex_dev.sandbox_filter import (
-            detect_go_loopback_tests,
-            detect_js_loopback_test_files,
-            detect_python_loopback_tests,
-            detect_rust_loopback_tests,
-            filter_builder_checks_for_sandbox,
-        )
+    def test_26_immutable_sandbox_security_boundary_never_expands_permissions(self) -> None:
+        import importlib.util
+        from codex_dev.codex_runner import run_codex_exec
+        from codex_dev.config import SandboxSecurityError, validate_sandbox_mode
 
-        # 1) Go: direct httptest.NewServer + helper calling net.Listen; pure unit test stays included
-        go_wt = self.tmp_path / "go_filter_wt"
-        (go_wt / "pkg").mkdir(parents=True)
-        (go_wt / "pkg" / "server_test.go").write_text(
-            "package pkg\n"
-            "import (\"net\"; \"net/http/httptest\"; \"testing\")\n"
-            "func startFixture(t *testing.T) { _, _ = net.Listen(\"tcp\", \"127.0.0.1:0\") }\n"
-            "func TestPureUnit(t *testing.T) {}\n"
-            "func TestHTTPFixture(t *testing.T) { _ = httptest.NewServer(nil) }\n"
-            "func TestViaHelper(t *testing.T) { startFixture(t) }\n",
+        # 1) Legacy sandbox_filter module is completely removed
+        self.assertIsNone(importlib.util.find_spec("codex_dev.sandbox_filter"))
+
+        # 2) Any attempt to configure or invoke danger-full-access (or non-workspace-write) is rejected immediately
+        for forbidden_mode in ("danger-full-access", "full-access", "read-only", ""):
+            with self.assertRaises(SandboxSecurityError):
+                validate_sandbox_mode(forbidden_mode)
+
+        repo = _create_python_repo(self.tmp_path / "immutable_sandbox_repo")
+        (repo / ".codex-dev.local.json").write_text(
+            json.dumps({"sandbox_mode": "danger-full-access"}),
             encoding="utf-8",
         )
-        self.assertEqual(detect_go_loopback_tests(go_wt), ["TestHTTPFixture", "TestViaHelper"])
-        go_filtered = filter_builder_checks_for_sandbox(
-            ["go vet ./...", "go test -race -short ./..."],
-            go_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=False,
-        )
-        self.assertTrue(go_filtered["rewritten"])
-        self.assertEqual(go_filtered["deferred_tests"], ["TestHTTPFixture", "TestViaHelper"])
-        self.assertEqual(go_filtered["checks"][0], "go vet ./...")
-        self.assertIn("-skip '^(TestHTTPFixture|TestViaHelper)$'", go_filtered["checks"][1])
+        with self.assertRaises(SandboxSecurityError):
+            self.orch.init_task(name="Reject danger-full-access", repo_path=repo)
+        (repo / ".codex-dev.local.json").unlink()
 
-        # Bypassed when builder.network_access=True
-        go_net = filter_builder_checks_for_sandbox(
-            ["go test -race -short ./..."],
-            go_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=True,
-        )
-        self.assertFalse(go_net["rewritten"])
-        self.assertEqual(go_net["checks"], ["go test -race -short ./..."])
+        tid_direct = self.orch.init_task(name="Direct runner check", repo_path=repo)["task"]["task_id"]
+        wt_direct = Path(self.orch.store.load_task_meta(tid_direct)["worktree_path"])
+        with self.assertRaises(SandboxSecurityError):
+            run_codex_exec(
+                store=self.orch.store,
+                task_id=tid_direct,
+                worktree_path=wt_direct,
+                codex_binary=MOCK_CODEX_CMD,
+                model="gpt-6-luna",
+                sandbox_mode="danger-full-access",
+                reasoning_effort="low",
+                prompt="noop",
+                timeout_sec=10,
+                repair_round=0,
+            )
 
-        # 2) Python / pytest
-        py_wt = self.tmp_path / "py_filter_wt"
-        (py_wt / "tests").mkdir(parents=True)
-        (py_wt / "tests" / "test_api.py").write_text(
-            "from http.server import HTTPServer\n"
-            "def test_pure():\n    assert 1 + 1 == 2\n\n"
-            "def test_loopback_http():\n    srv = HTTPServer(('127.0.0.1', 0), None)\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(detect_python_loopback_tests(py_wt), ["test_loopback_http"])
-        py_filtered = filter_builder_checks_for_sandbox(
-            ["python3 -m pytest -q"],
-            py_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=False,
-        )
-        self.assertTrue(py_filtered["rewritten"])
-        self.assertIn("-k 'not (test_loopback_http)'", py_filtered["checks"][0])
-
-        # 3) JS / Jest & Vitest
-        js_wt = self.tmp_path / "js_filter_wt"
-        (js_wt / "tests").mkdir(parents=True)
-        (js_wt / "tests" / "pure.test.ts").write_text("test('math', () => expect(1).toBe(1));\n", encoding="utf-8")
-        (js_wt / "tests" / "http.spec.ts").write_text(
-            "import http from 'node:http';\nhttp.createServer().listen(0);\n", encoding="utf-8"
-        )
-        self.assertEqual(detect_js_loopback_test_files(js_wt), ["tests/http.spec.ts"])
-        js_filtered = filter_builder_checks_for_sandbox(
-            ["npx jest", "npx vitest run"],
-            js_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=False,
-        )
-        self.assertIn("--testPathIgnorePatterns", js_filtered["checks"][0])
-        self.assertIn("--exclude tests/http.spec.ts", js_filtered["checks"][1])
-
-        # 4) Rust / cargo test
-        rs_wt = self.tmp_path / "rs_filter_wt"
-        (rs_wt / "tests").mkdir(parents=True)
-        (rs_wt / "tests" / "net.rs").write_text(
-            "#[test]\nfn pure_test() { assert_eq!(1, 1); }\n\n"
-            "#[tokio::test]\nasync fn binds_port() { let _ = TcpListener::bind(\"127.0.0.1:0\"); }\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(detect_rust_loopback_tests(rs_wt), ["binds_port"])
-        rs_filtered = filter_builder_checks_for_sandbox(
-            ["cargo test"],
-            rs_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=False,
-        )
-        self.assertEqual(rs_filtered["checks"][0], "cargo test -- --skip binds_port")
-
-        # 5) End-to-end orchestrator dispatch injects filtered Builder Checks & logs event without altering target repo
-        repo = _create_python_repo(self.tmp_path / "e2e_filter_repo")
-        (repo / "test_socket.py").write_text(
-            "import socket\ndef test_bind_port():\n    s = socket.socket(); s.bind(('127.0.0.1', 0))\n",
-            encoding="utf-8",
-        )
-        subprocess.run(["git", "add", "test_socket.py"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "add socket test"], cwd=repo, check=True, capture_output=True)
-        rec_file = self.tmp_path / "e2e_filter_rec.json"
+        # 3) Across code-repair rounds, mid-task config changes CANNOT expand network_access, add_dirs, or weaken strict isolation
+        rec_file = self.tmp_path / "perm_lock_rec.json"
         os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
-        os.environ["MOCK_CODEX_SCENARIO"] = "success"
-        tid = self.orch.init_task(name="Sandbox auto filter", repo_path=repo)["task"]["task_id"]
-        self.orch.save_plan(
-            tid,
-            PLAN_PY + "\n## Builder Checks\n- `pytest -q`\n",
+        os.environ["MOCK_CODEX_SCENARIO"] = "fix_on_round_2"
+        tid = self.orch.init_task(name="Retry permission immutability", repo_path=repo, complexity="low")["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+
+        r0 = self.orch.run_round(tid)
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["next_action"], "repair_available")
+
+        # Attempt to sneak expanded permissions into local repo config before Repair Round 1
+        sneaky_dir = self.tmp_path / "sneaky_writable_dir"
+        sneaky_dir.mkdir(parents=True, exist_ok=True)
+        (repo / ".codex-dev.local.json").write_text(
+            json.dumps(
+                {
+                    "builder": {"network_access": True},
+                    "builder_add_dirs": [str(sneaky_dir)],
+                    "builder_isolation": "inherit",
+                }
+            ),
+            encoding="utf-8",
         )
-        exec_res = self.orch.execute_round(tid)
-        self.assertTrue(exec_res["ok"])
-        rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
-        self.assertIn("pytest -q -k 'not (test_bind_port)'", rec["prompt"])
-        self.assertIn("automatically deferred to host verification", rec["prompt"])
-        ev_types = [e.get("type") for e in self.orch.store.read_events(tid)]
-        self.assertIn("builder_checks_filtered", ev_types)
+        r1 = self.orch.run_round(tid)
+        self.assertTrue(r1["ok"])
+
+        calls = json.loads(rec_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["sandbox"], "workspace-write")
+            self.assertNotIn("sandbox_workspace_write.network_access=true", call["configs"])
+            self.assertNotIn(str(sneaky_dir.resolve()), call["add_dirs"])
+            self.assertIn("plugins", call["disabled"])
 
     def test_27_host_verify_no_cache_normalization(self) -> None:
         from codex_dev.verifier import apply_no_cache_verify_command, detect_verification_commands
@@ -1503,9 +1465,9 @@ Add standalone documents with migration, API, and integration tests.
         self.assertTrue(exec_res["ok"])
         rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
         self.assertEqual(rec["model"], "gpt-6.2-sol")
-        # Hardened Builder prompt explicitly prohibits early partial / zero-diff exits
-        self.assertIn("Complete the FULL implementation across all Target Files", rec["prompt"])
-        self.assertIn("post-execution invariant guard", rec["prompt"])
+        # Slimmed Builder prompt prohibits early partial / zero-diff exits without legacy bloat
+        self.assertIn("Complete the FULL implementation", rec["prompt"])
+        self.assertIn("do NOT expand task scope or exit with partial/zero edits", rec["prompt"])
 
         # 3) Locked manual model is NEVER overridden by plan-scope promotion
         tid_locked = self.orch.init_task(
@@ -1532,7 +1494,7 @@ Add standalone documents with migration, API, and integration tests.
         self.assertEqual(eff_res["state"]["model_policy"]["current_model"], "gpt-6.2-sol")
         self.assertEqual(eff_res["state"]["model_policy"]["current_reasoning_effort"], "low")
 
-        # 5) Network-enabled sandbox prompt also includes completion/ready_for_verify instruction
+        # 5) Network-enabled sandbox prompt explicitly declares enabled network access and completion status
         net_prompt = build_codex_prompt(
             task_name="Net sandbox",
             plan_text=PLAN_PY,
@@ -1541,7 +1503,7 @@ Add standalone documents with migration, API, and integration tests.
             worktree_path=self.tmp_path,
             builder_network_access=True,
         )
-        self.assertIn("Complete the FULL implementation across all Target Files", net_prompt)
+        self.assertIn("Network access: enabled", net_prompt)
         self.assertIn("ready_for_verify", net_prompt)
 
     def test_30_structured_skip_detection_tri_state_observability_and_changed_test_guard(self) -> None:
@@ -1694,77 +1656,58 @@ Add standalone documents with migration, API, and integration tests.
         block_codes = [b["code"] for b in ver_g["report"]["diff_audit"]["blocking_issues"]]
         self.assertIn("changed_tests_skipped", block_codes)
 
-    def test_31_offline_sandbox_embedded_servers_and_manifest_guidance(self) -> None:
-        from codex_dev.sandbox_filter import (
-            detect_go_loopback_tests,
-            detect_plan_dependency_manifests,
-            filter_builder_checks_for_sandbox,
-        )
+    def test_31_pre_builder_prepare_gate_and_baseline_empty_diff_guard(self) -> None:
+        repo = _create_python_repo(self.tmp_path / "pre_prep_gate_repo")
+        rec_file = self.tmp_path / "pre_prep_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
 
-        # 1) Go embedded loopback servers (miniredis, tls.Listen, embeddedpostgres) + 4-hop helper chain
-        go_wt = self.tmp_path / "go_embedded_wt"
-        (go_wt / "internal" / "cache").mkdir(parents=True)
-        (go_wt / "internal" / "cache" / "redis_test.go").write_text(
-            "package cache\n"
-            "import (\"crypto/tls\"; \"testing\")\n"
-            "func hop4() { _ = miniredis.Run() }\n"
-            "func hop3() { hop4() }\n"
-            "func hop2() { hop3() }\n"
-            "func hop1() { hop2() }\n"
-            "func TestPureCacheKey(t *testing.T) {}\n"
-            "func TestRedisSearchCache(t *testing.T) { _ = miniredis.RunT(t) }\n"
-            "func TestNewMiniRedis(t *testing.T) { _ = miniredis.NewMiniRedis() }\n"
-            "func TestTLSListener(t *testing.T) { _, _ = tls.Listen(\"tcp\", \"127.0.0.1:0\", nil) }\n"
-            "func TestEmbeddedPG(t *testing.T) { _ = embeddedpostgres.NewDatabase() }\n"
-            "func TestDeepHelperChain(t *testing.T) { hop1() }\n",
+        plan_with_env = (
+            PLAN_PY
+            + "\n## Environment Requirements\n"
+            + "- Python 3.11+ standard library (`unittest`)\n"
+            + "- Pre-staged marker `env_ready.txt` before Builder starts\n"
+            + "\n## Builder Checks\n"
+            + "- `pytest -q`\n"
+        )
+        parsed = parse_plan_markdown(plan_with_env)
+        self.assertEqual(len(parsed["environment_requirements"]), 2)
+        self.assertIn("Python 3.11+ standard library", parsed["environment_requirements"][0])
+
+        # 1) Missing Codex binary fails pre-Builder readiness gate BEFORE Builder is invoked
+        (repo / ".codex-dev.local.json").write_text(
+            json.dumps({"codex_binary": "/nonexistent/codex-missing-bin"}),
             encoding="utf-8",
         )
-        detected = detect_go_loopback_tests(go_wt)
-        self.assertEqual(
-            detected,
-            [
-                "TestDeepHelperChain",
-                "TestEmbeddedPG",
-                "TestNewMiniRedis",
-                "TestRedisSearchCache",
-                "TestTLSListener",
-            ],
-        )
-        filtered = filter_builder_checks_for_sandbox(
-            ["go test -short ./..."],
-            go_wt,
-            sandbox_mode="workspace-write",
-            builder_network_access=False,
-        )
-        self.assertTrue(filtered["rewritten"])
-        self.assertIn("TestRedisSearchCache", filtered["deferred_tests"])
-        self.assertIn("TestRedisSearchCache", filtered["checks"][0])
+        tid_missing_bin = self.orch.init_task(name="Missing codex bin gate", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid_missing_bin, plan_with_env)
+        miss_res = self.orch.run_round(tid_missing_bin)
+        self.assertFalse(miss_res["ok"])
+        self.assertEqual(miss_res["stage"], "prepare")
+        self.assertEqual(miss_res["next_action"], "blocked_dependency_prepare")
+        self.assertEqual(miss_res["state"]["execution_attempts"], 0)
+        self.assertFalse(rec_file.exists())
+        (repo / ".codex-dev.local.json").unlink()
 
-        # 2) Dependency manifest detection from PLAN.md target_files
-        self.assertEqual(
-            detect_plan_dependency_manifests(
-                ["go.mod", "./services/api/go.mod", "go.sum", "package.json", "Cargo.toml", "pyproject.toml", "requirements-dev.txt", "README.md"]
-            ),
-            ["go.mod", "services/api/go.mod", "package.json", "Cargo.toml", "pyproject.toml", "requirements-dev.txt"],
-        )
+        # 2) Pre-prepare touching files before Builder runs does NOT let a zero-edit Builder sneak past empty_diff
+        os.environ["MOCK_CODEX_SCENARIO"] = "empty_diff_completed"
+        tid_noop = self.orch.init_task(
+            name="Pre-prepare baseline empty diff guard",
+            repo_path=repo,
+            prepare_commands=["python3 -c \"open('env_ready.txt', 'w').write('ready\\n')\""],
+        )["task"]["task_id"]
+        plan_res = self.orch.save_plan(tid_noop, plan_with_env)
+        self.assertEqual(len(plan_res["contract"]["environment_requirements"]), 2)
+        noop_res = self.orch.run_round(tid_noop)
+        self.assertFalse(noop_res["ok"])
+        self.assertEqual(noop_res["stage"], "execute")
+        self.assertEqual(noop_res["next_action"], "repair_available")
+        self.assertEqual(noop_res["state"]["failure_category"], "empty_diff")
 
-        # 3) End-to-end Round 0 prompt injects offline dependency notice when go.mod is in Target Files
-        repo = _create_python_repo(self.tmp_path / "offline_manifest_repo")
-        rec_file = self.tmp_path / "offline_manifest_rec.json"
-        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_file)
-        os.environ["MOCK_CODEX_SCENARIO"] = "success"
-        tid = self.orch.init_task(name="Offline manifest guidance", repo_path=repo)["task"]["task_id"]
-        plan_with_manifest = (
-            PLAN_PY.replace("## Target Files\n- `calc.py`", "## Target Files\n- `go.mod`\n- `calc.py`")
-            + "\n## Builder Checks\n- `python3 -m unittest discover -v`\n"
-        )
-        self.orch.save_plan(tid, plan_with_manifest)
-        res = self.orch.execute_round(tid)
-        self.assertTrue(res["ok"])
+        # 3) Builder Checks are passed verbatim without any automatic -skip / -k test filtering
         rec = json.loads(rec_file.read_text(encoding="utf-8"))[0]
-        self.assertIn("OFFLINE SANDBOX DEPENDENCY NOTICE", rec["prompt"])
-        self.assertIn("`go.mod`", rec["prompt"])
-        self.assertIn("Do NOT attempt network downloads", rec["prompt"])
+        self.assertIn("- `pytest -q`", rec["prompt"])
+        self.assertNotIn("-k 'not", rec["prompt"])
+        self.assertNotIn("OFFLINE SANDBOX DEPENDENCY NOTICE", rec["prompt"])
 
     def test_32_failed_verify_full_logs_and_failure_context_excerpt(self) -> None:
         from codex_dev.verifier import extract_failure_excerpt
@@ -1822,19 +1765,19 @@ Add standalone documents with migration, API, and integration tests.
         self.assertIn("GET /api/v1/ping returned 503, expected 200", fb)
         self.assertIn(str(stderr_log), fb)
 
-    def test_33_same_package_companion_audit_ack_warning_and_rm_prompt_rule(self) -> None:
+    def test_33_same_package_companion_audit_and_ack_warning(self) -> None:
         from codex_dev.verifier import audit_diff_integrity
 
-        # 1) Builder prompt warns against shell `rm -f`/`rm -rf` so Codex CLI policy does not reject inline cleanup
+        # 1) Slimmed Builder prompt removes shell `rm -f` / `tempfile` tool-specific special instructions
         prompt = build_codex_prompt(
-            task_name="Sandbox rm hygiene",
+            task_name="Slimmed prompt check",
             plan_text=PLAN_PY,
             feedback_text=None,
             repair_round=0,
             worktree_path=self.tmp_path,
         )
-        self.assertIn("rm -f", prompt)
-        self.assertIn("tempfile.TemporaryDirectory()", prompt)
+        self.assertNotIn("rm -f", prompt)
+        self.assertNotIn("tempfile.TemporaryDirectory()", prompt)
 
         # 2) Same-package modified companion source file does not trigger noisy unexpected_files,
         #    while unrelated files, root siblings, new files, and undeclared test/config files still do.
@@ -1894,6 +1837,105 @@ Add standalone documents with migration, API, and integration tests.
         exec_log = (self.orch.store.task_dir(tid) / "EXECUTION_LOG.md").read_text(encoding="utf-8")
         self.assertIn("Acknowledged Warnings", exec_log)
         self.assertIn(ack_msg, exec_log)
+
+    def test_34_environment_exception_single_retry_escalation_and_antigravity_recovery(self) -> None:
+        repo = _create_python_repo(self.tmp_path / "env_retry_repo")
+
+        # 1) Transient sandbox permission error recovers on the 1 automatic env retry:
+        #    - NO model escalation (stays gpt-6-luna in auto mode!)
+        #    - NO effort escalation (stays low!)
+        #    - NO permission expansion (stays workspace-write, network_access=False)
+        #    - Worktree edits from Attempt 1 preserved
+        #    - First failure concrete error injected into retry prompt
+        #    - repair_round remains 0 (code repair quota untouched!)
+        rec_a = self.tmp_path / "env_retry_success_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_a)
+        os.environ["MOCK_CODEX_SCENARIO"] = "env_perm_once_then_success"
+        tid_a = self.orch.init_task(name="Env retry succeeds once", repo_path=repo, complexity="low")["task"]["task_id"]
+        self.orch.save_plan(tid_a, PLAN_PY)
+        res_a = self.orch.run_round(tid_a)
+        self.assertTrue(res_a["ok"])
+        self.assertEqual(res_a["next_action"], "review_required")
+        st_a = res_a["state"]
+        self.assertEqual(st_a["status"], STATE_REVIEWING)
+        self.assertEqual(st_a["env_retry_count"], 1)
+        self.assertEqual(st_a["repair_round"], 0)
+        self.assertEqual(st_a["execution_attempts"], 2)
+        self.assertEqual(st_a["model_policy"]["current_model"], "gpt-6-luna")
+        self.assertEqual(st_a["model_policy"]["current_reasoning_effort"], "low")
+
+        calls_a = json.loads(rec_a.read_text(encoding="utf-8"))
+        self.assertEqual(len(calls_a), 2)
+        self.assertEqual([c["model"] for c in calls_a], ["gpt-6-luna", "gpt-6-luna"])
+        self.assertEqual([c["sandbox"] for c in calls_a], ["workspace-write", "workspace-write"])
+        self.assertFalse(calls_a[0]["has_env_retry"])
+        self.assertTrue(calls_a[1]["has_env_retry"])
+        self.assertIn("listen tcp 127.0.0.1:0: bind: operation not permitted", calls_a[1]["prompt"])
+        self.assertIn("draft_progress.txt", calls_a[1]["prompt"])
+        for c in calls_a:
+            self.assertNotIn("sandbox_workspace_write.network_access=true", c["configs"])
+
+        # 2) Persistent missing dependency exhausts the 1 env retry -> BLOCKED (blocked_environment),
+        #    persists ENVIRONMENT_REPORT.json + both attempt JSONLs + EXECUTION_LOG.md, preserves worktree,
+        #    keeps repair_round=0; then Antigravity prepares the dependency and resumes cleanly!
+        rec_b = self.tmp_path / "env_retry_blocked_rec.json"
+        os.environ["MOCK_CODEX_RECORD_FILE"] = str(rec_b)
+        os.environ["MOCK_CODEX_SCENARIO"] = "env_missing_dep_until_prepared"
+        tid_b = self.orch.init_task(name="Env retry exhausted then resolved", repo_path=repo, complexity="low")["task"]["task_id"]
+        self.orch.save_plan(tid_b, PLAN_PY)
+        res_b = self.orch.run_round(tid_b)
+        self.assertFalse(res_b["ok"])
+        self.assertEqual(res_b["stage"], "execute")
+        self.assertEqual(res_b["next_action"], "blocked_environment")
+        st_b = res_b["state"]
+        self.assertEqual(st_b["status"], STATE_BLOCKED)
+        self.assertEqual(st_b["failure_category"], "environment_failure")
+        self.assertEqual(st_b["env_retry_count"], 1)
+        self.assertEqual(st_b["repair_round"], 0)
+        self.assertEqual(st_b["execution_attempts"], 2)
+
+        tdir_b = self.orch.store.task_dir(tid_b)
+        wt_b = Path(self.orch.store.load_task_meta(tid_b)["worktree_path"])
+        self.assertTrue((wt_b / "calc.py").is_file())
+        self.assertTrue((tdir_b / "ENVIRONMENT_REPORT.json").is_file())
+        self.assertTrue((tdir_b / "codex_round_0_attempt_1.jsonl").is_file())
+        self.assertTrue((tdir_b / "codex_round_0_attempt_2.jsonl").is_file())
+        env_rep = json.loads((tdir_b / "ENVIRONMENT_REPORT.json").read_text(encoding="utf-8"))
+        self.assertEqual(env_rep["kind"], "missing_dependency")
+        self.assertFalse(env_rep["repair_round_consumed"])
+        self.assertFalse(env_rep["model_escalated"])
+        self.assertFalse(env_rep["permission_expanded"])
+        self.assertTrue(env_rep["worktree_preserved"])
+        self.assertIn("calc.py", env_rep["files_changed"])
+        status_snap = self.orch.get_status(tid_b)
+        self.assertIsNotNone(status_snap["environment_report"])
+
+        # Antigravity resolves the missing dependency on host via prepare_task -> unblocks and resets env_retry_count
+        prep_fix = self.orch.prepare_task(
+            tid_b,
+            prepare_commands=["python3 -c \"open('dep_ready.marker', 'w').write('ok\\n')\""],
+        )
+        self.assertTrue(prep_fix["ok"])
+        self.assertEqual(prep_fix["state"]["status"], STATE_PLANNED)
+        self.assertEqual(prep_fix["state"]["env_retry_count"], 0)
+        self.assertEqual(prep_fix["state"]["repair_round"], 0)
+
+        res_b_resumed = self.orch.run_round(tid_b)
+        self.assertTrue(res_b_resumed["ok"])
+        self.assertEqual(res_b_resumed["next_action"], "review_required")
+        self.assertEqual(res_b_resumed["state"]["repair_round"], 0)
+
+        # 3) Non-zero CLI exit with sandbox-exec EPERM stderr signature also classifies as environment_failure (max 1 retry)
+        os.environ["MOCK_CODEX_SCENARIO"] = "env_stderr_eperm_crash"
+        tid_c = self.orch.init_task(name="Stderr EPERM signature", repo_path=repo, complexity="low")["task"]["task_id"]
+        self.orch.save_plan(tid_c, PLAN_PY)
+        res_c = self.orch.run_round(tid_c)
+        self.assertFalse(res_c["ok"])
+        self.assertEqual(res_c["next_action"], "blocked_environment")
+        self.assertEqual(res_c["state"]["failure_category"], "environment_failure")
+        self.assertEqual(res_c["state"]["env_retry_count"], 1)
+        self.assertEqual(res_c["state"]["repair_round"], 0)
+        self.assertEqual(res_c["environment_report"]["kind"], "permission_denied")
 
 
 if __name__ == "__main__":

@@ -566,8 +566,10 @@ def detect_prepare_commands(
     config: dict[str, Any],
     contract: dict[str, Any] | None = None,
     explicit_commands: list[str] | None = None,
+    *,
+    phase: str = "all",
 ) -> tuple[str, list[dict[str, str]]]:
-    """Resolve non-sandbox dependency preparation commands (e.g. go mod tidy when go.mod changed)."""
+    """Resolve host environment/dependency preparation commands by phase ('pre', 'post', or 'all')."""
     prep_cfg = config.get("prepare") or {}
     if not bool(prep_cfg.get("enabled", True)) and not explicit_commands:
         return ("disabled", [])
@@ -575,15 +577,19 @@ def detect_prepare_commands(
     if explicit_commands:
         return ("explicit", _normalize_cmd_list(explicit_commands, default_kind="prepare", prefix="prepare"))
 
-    if contract and contract.get("prepare_commands"):
-        norm = _normalize_cmd_list(contract["prepare_commands"], default_kind="prepare", prefix="prepare")
-        if norm:
-            return ("plan_contract", norm)
+    if phase in ("pre", "all"):
+        if contract and contract.get("prepare_commands"):
+            norm = _normalize_cmd_list(contract["prepare_commands"], default_kind="prepare", prefix="prepare")
+            if norm:
+                return ("plan_contract", norm)
 
-    if isinstance(prep_cfg, dict) and prep_cfg.get("commands"):
-        norm = _normalize_cmd_list(prep_cfg["commands"], default_kind="prepare", prefix="prepare")
-        if norm:
-            return ("config", norm)
+        if isinstance(prep_cfg, dict) and prep_cfg.get("commands"):
+            norm = _normalize_cmd_list(prep_cfg["commands"], default_kind="prepare", prefix="prepare")
+            if norm:
+                return ("config", norm)
+
+        if phase == "pre":
+            return ("none", [])
 
     detected: list[dict[str, str]] = []
     auto_go_tidy = bool(prep_cfg.get("auto_go_mod_tidy", True)) if isinstance(prep_cfg, dict) else True
@@ -754,6 +760,25 @@ def _is_same_package_companion(
     return False
 
 
+def _check_codex_binary_available(codex_binary: str) -> str | None:
+    """Verify that the configured Codex CLI launcher/binary exists before starting Builder."""
+    raw = (codex_binary or "").strip()
+    if not raw:
+        return "Builder codex_binary is empty."
+    if Path(raw).is_file():
+        return None
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        return f"Invalid codex_binary command {raw!r}: {exc}"
+    if not tokens:
+        return "Builder codex_binary is empty."
+    exe = tokens[0]
+    if Path(exe).is_file() or shutil.which(exe) is not None:
+        return None
+    return f"Builder binary not found on host: {exe!r} (from codex_binary={raw!r})"
+
+
 def run_dependency_prepare(
     *,
     task_dir: Path,
@@ -763,16 +788,20 @@ def run_dependency_prepare(
     explicit_commands: list[str] | None = None,
     explicit_env: dict[str, str] | None = None,
     timeout_sec: int | None = None,
+    phase: str = "pre",
+    check_codex_binary: str | None = None,
 ) -> dict[str, Any]:
-    """Run non-sandbox dependency preparation commands outside Codex's offline sandbox."""
+    """Run host-level environment/dependency preparation ('pre' before Builder, 'post' tidy after Builder)."""
     contract = read_json(task_dir / "contract.json")
-    diff_info = inspect_worktree_changes(worktree_path, base_commit, include_diff=False)
+    diff_before = inspect_worktree_changes(worktree_path, base_commit, include_diff=False)
+    before_changed = set(diff_before.get("all_changed_files") or [])
     source, commands = detect_prepare_commands(
         worktree_path,
-        diff_info,
+        diff_before,
         config,
         contract=contract,
         explicit_commands=explicit_commands,
+        phase=phase,
     )
 
     prep_cfg = config.get("prepare") or {}
@@ -784,7 +813,43 @@ def run_dependency_prepare(
     failed_count = 0
     generated_allowed_files: list[str] = []
     prep_log_dir = task_dir / "prepare_logs"
-    if prep_log_dir.exists():
+
+    if phase == "pre" and check_codex_binary is not None:
+        bin_err = _check_codex_binary_available(check_codex_binary)
+        if bin_err is not None:
+            failed_count += 1
+            results.append(
+                {
+                    "name": "toolchain:codex-binary",
+                    "kind": "prepare",
+                    "command": check_codex_binary,
+                    "passed": False,
+                    "exit_code": 127,
+                    "timed_out": False,
+                    "duration_sec": 0.0,
+                    "stdout_tail": "",
+                    "stderr_tail": bin_err,
+                    "stderr_excerpt": bin_err,
+                }
+            )
+            report_fail = {
+                "prepared_at": utc_now(),
+                "phase": phase,
+                "ran": True,
+                "passed": False,
+                "command_source": "toolchain_check",
+                "commands_total": 1,
+                "commands_passed": 0,
+                "commands_failed": 1,
+                "checks": results,
+                "generated_allowed_files": [],
+                "post_prepare_changed_files": sorted(before_changed),
+                "failure_reasons": [bin_err],
+            }
+            atomic_write_json(task_dir / "prepare.json", report_fail)
+            return report_fail
+
+    if commands and prep_log_dir.exists() and phase == "pre":
         shutil.rmtree(prep_log_dir, ignore_errors=True)
 
     for item in commands:
@@ -830,7 +895,12 @@ def run_dependency_prepare(
                 generated_allowed_files.append(f"{sub}/go.sum")
         else:
             failed_count += 1
-            stdout_log_path, stderr_log_path = _persist_check_logs(prep_log_dir, name, full_stdout, full_stderr)
+            stdout_log_path, stderr_log_path = _persist_check_logs(
+                prep_log_dir,
+                f"{phase}_{name}",
+                full_stdout,
+                full_stderr,
+            )
 
         entry: dict[str, Any] = {
             "name": name,
@@ -854,6 +924,16 @@ def run_dependency_prepare(
                 entry["stderr_excerpt"] = extract_failure_excerpt(full_stderr)
         results.append(entry)
 
+    diff_after = (
+        inspect_worktree_changes(worktree_path, base_commit, include_diff=False)
+        if results
+        else diff_before
+    )
+    after_changed = set(diff_after.get("all_changed_files") or [])
+    if phase == "pre" and failed_count == 0:
+        for fpath in sorted(after_changed - before_changed):
+            generated_allowed_files.append(fpath)
+
     failure_reasons = [
         f"Prepare '{r['name']}' failed (exit={r['exit_code']}): {r['command']}"
         + (f" — {r['stderr_tail'].splitlines()[-1][:200]}" if r["stderr_tail"].strip() else "")
@@ -863,6 +943,7 @@ def run_dependency_prepare(
 
     report = {
         "prepared_at": utc_now(),
+        "phase": phase,
         "ran": len(results) > 0,
         "passed": failed_count == 0,
         "command_source": source,
@@ -871,10 +952,15 @@ def run_dependency_prepare(
         "commands_failed": failed_count,
         "checks": results,
         "generated_allowed_files": sorted(set(generated_allowed_files)),
+        "post_prepare_changed_files": sorted(after_changed),
         "failure_reasons": failure_reasons,
     }
     if results:
         atomic_write_json(task_dir / "prepare.json", report)
+        if phase == "pre":
+            atomic_write_json(task_dir / "pre_prepare.json", report)
+        elif phase == "post":
+            atomic_write_json(task_dir / "post_prepare.json", report)
     return report
 
 

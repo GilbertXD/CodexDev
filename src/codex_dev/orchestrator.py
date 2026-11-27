@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import time
 from pathlib import Path
 from typing import Any
 
-from .codex_runner import build_codex_prompt, run_codex_exec
-from .sandbox_filter import detect_plan_dependency_manifests, filter_builder_checks_for_sandbox
+from .codex_runner import (
+    CodexRunOutcome,
+    build_codex_prompt,
+    classify_environment_exception,
+    resolve_builder_writable_dirs,
+    run_codex_exec,
+)
 from .config import (
+    ENFORCED_SANDBOX_MODE,
     ensure_default_global_config,
     get_codex_dev_home,
     load_config,
     read_local_codex_hints,
     resolve_codex_timeouts,
+    validate_sandbox_mode,
 )
 from .contract import (
     save_immutable_contract,
@@ -133,18 +141,68 @@ def _record_attempt_token_accounting(
     return tok
 
 
+def _hash_worktree_files(worktree_path: Path, rel_paths: list[str]) -> dict[str, str]:
+    """Capture SHA-256 digests of worktree files touched during pre-Builder preparation."""
+    digests: dict[str, str] = {}
+    for rel in rel_paths:
+        fpath = worktree_path / rel
+        if fpath.is_file():
+            try:
+                digests[rel] = hashlib.sha256(fpath.read_bytes()).hexdigest()
+            except OSError:
+                digests[rel] = "unreadable"
+        else:
+            digests[rel] = "missing"
+    return digests
+
+
+def _count_builder_delta_files(
+    worktree_path: Path,
+    diff_stats: dict[str, Any] | None,
+    pre_builder_hashes: dict[str, str] | None,
+) -> int:
+    """Count worktree file changes attributable to Builder (excluding unchanged pre-prepare artifacts)."""
+    raw_count = int((diff_stats or {}).get("files_changed_count", 0))
+    if not pre_builder_hashes:
+        return raw_count
+
+    current_files = [
+        str(item["path"])
+        for item in ((diff_stats or {}).get("files") or [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    current_set = set(current_files)
+    delta = 0
+    for rel in current_files:
+        if rel not in pre_builder_hashes:
+            delta += 1
+            continue
+        cur_hash = _hash_worktree_files(worktree_path, [rel]).get(rel)
+        if cur_hash != pre_builder_hashes[rel]:
+            delta += 1
+    for pre_rel in pre_builder_hashes:
+        if pre_rel not in current_set:
+            delta += 1
+    return delta
+
+
 def _check_post_execution_invariants(
     structured_result: dict[str, Any] | None,
     diff_stats: dict[str, Any] | None,
     *,
     allow_empty_diff: bool = False,
+    effective_files_changed: int | None = None,
 ) -> tuple[str | None, str | None]:
     """Enforce deterministic post-execution invariants before entering host verification.
 
     Prevents incomplete (`status == 'partial'`) or zero-change (`files_changed_count == 0`)
     Builder exits from silently passing host verification against an unmodified baseline.
     """
-    files_changed = int((diff_stats or {}).get("files_changed_count", 0))
+    files_changed = (
+        int(effective_files_changed)
+        if effective_files_changed is not None
+        else int((diff_stats or {}).get("files_changed_count", 0))
+    )
     status = str((structured_result or {}).get("status") or "").strip().lower()
     summary = str((structured_result or {}).get("summary") or "").strip()
 
@@ -160,11 +218,47 @@ def _check_post_execution_invariants(
         detail = f" (Builder summary: {summary[:240]})" if summary else ""
         return (
             "empty_diff",
-            f"Builder exited with zero worktree file changes relative to base commit{detail}; "
+            f"Builder exited with zero worktree file changes relative to prepared baseline{detail}; "
             "refusing to run verification against an unchanged baseline.",
         )
 
     return (None, None)
+
+
+def _format_env_retry_feedback(
+    env_exc: dict[str, Any],
+    *,
+    changed_files: list[str],
+    writable_dirs: list[str],
+    network_access: bool,
+) -> str:
+    """Format concise, factual context for the single non-escalating environment retry."""
+    lines = [
+        f"- Previous attempt failed due to environment/sandbox constraint (`{env_exc.get('kind')}`): {env_exc.get('detail')}",
+        f"- Sandbox permissions remain locked (`{ENFORCED_SANDBOX_MODE}`, network_access={'enabled' if network_access else 'disabled (offline)'}).",
+        "- Writable directories: " + ", ".join(f"`{d}`" for d in writable_dirs),
+    ]
+    failed_cmds = env_exc.get("failed_commands") or []
+    if failed_cmds:
+        lines.append("- Failed command(s) from previous attempt:")
+        for item in failed_cmds[:5]:
+            lines.append(
+                f"  - `{item.get('command')}` (exit={item.get('exit_code')}): {str(item.get('summary') or '')[:200]}"
+            )
+    if changed_files:
+        lines.append(
+            "- Existing worktree edits were preserved: "
+            + ", ".join(f"`{p}`" for p in changed_files[:20])
+        )
+    lines.extend(
+        [
+            "- Keep valid existing edits in the worktree.",
+            "- Do NOT repeat unpermitted operations outside your writable directories or network boundary.",
+            "- If the PLAN and specified Builder Checks can be completed cleanly within these boundaries, finish and return `status: \"ready_for_verify\"` or `status: \"completed\"` with `error_type: \"none\"`.",
+            "- If a required dependency or specified Builder Check genuinely cannot execute inside this sandbox, stop immediately and return `status: \"blocked\"` with the exact `error_type` and `error_detail`.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _format_execution_invariant_feedback(
@@ -335,6 +429,19 @@ class Orchestrator:
 
         created_at = utc_now()
         max_repairs = int(max_repair_rounds if max_repair_rounds is not None else cfg.get("max_repair_rounds", 3))
+        max_env_retries = min(1, max(0, int(cfg.get("max_env_retries", 1))))
+        builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
+        _, _, init_writable_dirs = resolve_builder_writable_dirs(
+            tdir,
+            Path(wt_info["worktree_path"]),
+            cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
+        )
+        initial_boundary = {
+            "sandbox_mode": validate_sandbox_mode(cfg.get("sandbox_mode")),
+            "network_access": bool(builder_cfg.get("network_access", False)),
+            "writable_dirs": init_writable_dirs,
+            "builder_isolation": str(cfg.get("builder_isolation") or "strict"),
+        }
 
         task_meta = {
             "task_id": tid,
@@ -370,6 +477,14 @@ class Orchestrator:
             "model_history": [],
             "repair_round": 0,
             "max_repair_rounds": max_repairs,
+            "env_prepared": False,
+            "env_retry_count": 0,
+            "max_env_retries": max_env_retries,
+            "environment_error": None,
+            "sandbox_boundary": initial_boundary,
+            "locked_sandbox_boundary": None,
+            "pre_builder_file_hashes": {},
+            "pre_prepare_allowed_files": [],
             "execution_attempts": 0,
             "failure_category": None,
             "last_error": None,
@@ -473,6 +588,8 @@ class Orchestrator:
             )
             state["contract_sha256"] = contract["plan_sha256"]
             state["acceptance_criteria"] = contract["acceptance_criteria"]
+            state["environment_requirements"] = contract.get("environment_requirements") or []
+            state["env_prepared"] = False
 
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
             hints = read_local_codex_hints()
@@ -493,6 +610,7 @@ class Orchestrator:
                     "plan_sha256": contract["plan_sha256"],
                     "acceptance_criteria_count": len(contract["acceptance_criteria"]),
                     "target_files": contract["target_files"],
+                    "environment_requirements": contract.get("environment_requirements") or [],
                 },
             )
             if promotion.get("promoted"):
@@ -504,12 +622,14 @@ class Orchestrator:
                     message=str(promotion.get("reason") or "Promoted task model policy based on PLAN.md scope."),
                     details=promotion,
                 )
+            env_reqs = contract.get("environment_requirements") or []
             self.store.append_execution_log(
                 tid,
                 "Plan Contract Locked",
                 f"- SHA-256: `{contract['plan_sha256']}`\n"
                 f"- Acceptance criteria: {len(contract['acceptance_criteria'])}\n"
                 f"- Target files: {', '.join(contract['target_files']) or '(unspecified)'}\n"
+                + (f"- Environment requirements: {'; '.join(env_reqs)}\n" if env_reqs else "")
                 + (
                     f"- Scope auto-promotion: {promotion['reason']}\n"
                     if promotion.get("promoted")
@@ -521,6 +641,149 @@ class Orchestrator:
                 res["plan_scope_promotion"] = promotion
             return res
 
+    def _compute_config_sandbox_boundary(
+        self,
+        tdir: Path,
+        worktree_path: Path,
+        cfg: dict[str, Any],
+    ) -> dict[str, Any]:
+        sandbox_mode = validate_sandbox_mode(cfg.get("sandbox_mode"))
+        builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
+        extra_add_dirs = [
+            str(Path(d).expanduser().resolve())
+            for d in (cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else [])
+            if isinstance(d, str) and d.strip()
+        ]
+        eff_isolation = str(cfg.get("builder_isolation") or "strict")
+        if eff_isolation not in ("strict", "inherit"):
+            eff_isolation = "strict"
+        _, _, writable_dirs = resolve_builder_writable_dirs(tdir, worktree_path, extra_add_dirs)
+        return {
+            "sandbox_mode": sandbox_mode,
+            "network_access": bool(builder_cfg.get("network_access", False)),
+            "extra_add_dirs": extra_add_dirs,
+            "writable_dirs": writable_dirs,
+            "builder_isolation": eff_isolation,
+        }
+
+    def _run_pre_prepare_locked(
+        self,
+        tid: str,
+        tdir: Path,
+        meta: dict[str, Any],
+        state: dict[str, Any],
+        cfg: dict[str, Any],
+        *,
+        prepare_commands: list[str] | None = None,
+        explicit_env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        refresh_boundary_on_explicit_prepare: bool = False,
+    ) -> dict[str, Any]:
+        """Run pre-Builder environment & dependency preparation while holding the task write lock."""
+        worktree_path = Path(meta["worktree_path"])
+        effective_prep = (
+            prepare_commands
+            if prepare_commands is not None
+            else (meta.get("explicit_prepare_commands") or None)
+        )
+        effective_env = {**dict(meta.get("explicit_verify_env") or {}), **dict(explicit_env or {})}
+        codex_bin = str(cfg.get("codex_binary") or "codex")
+
+        prep_report = run_dependency_prepare(
+            task_dir=tdir,
+            worktree_path=worktree_path,
+            base_commit=meta["base_commit"],
+            config=cfg,
+            explicit_commands=effective_prep,
+            explicit_env=effective_env or None,
+            timeout_sec=timeout_sec,
+            phase="pre",
+            check_codex_binary=codex_bin,
+        )
+
+        if prep_report["ran"]:
+            self.store.append_event(
+                tid,
+                phase="plan" if state.get("repair_round", 0) == 0 else "repair",
+                agent="Orchestrator (Environment Prepare)",
+                event_type="prepare_completed" if prep_report["passed"] else "prepare_failed",
+                message=(
+                    f"Pre-Builder environment preparation {'passed' if prep_report['passed'] else 'failed'} "
+                    f"({prep_report['commands_passed']}/{prep_report['commands_total']} checks, source={prep_report['command_source']})."
+                ),
+                details={
+                    "phase": "pre",
+                    "commands_passed": prep_report["commands_passed"],
+                    "commands_total": prep_report["commands_total"],
+                    "source": prep_report["command_source"],
+                },
+            )
+            self.store.append_execution_log(
+                tid,
+                f"Pre-Builder Environment Preparation ({'PASSED' if prep_report['passed'] else 'FAILED'})",
+                f"- Source: `{prep_report['command_source']}` | Passed: `{prep_report['commands_passed']}/{prep_report['commands_total']}`\n"
+                + (
+                    "- Failures:\n" + "\n".join(f"  - {r}" for r in prep_report["failure_reasons"]) + "\n"
+                    if prep_report["failure_reasons"]
+                    else ""
+                ),
+            )
+
+        if not prep_report["passed"]:
+            state["env_prepared"] = False
+            err_msg = "; ".join(prep_report["failure_reasons"])[:800] or "Pre-Builder environment preparation failed."
+            self.store.transition(
+                tid,
+                state,
+                STATE_BLOCKED,
+                event_type="dependency_prepare_blocked",
+                message=f"Environment preparation failed before starting Builder (repair round not consumed): {err_msg}",
+                failure_category="dependency_prepare_failure",
+                last_error=err_msg,
+                details={"stage": "pre_execute", "prepare": prep_report},
+            )
+            return {
+                "ok": False,
+                "next_action": "blocked_dependency_prepare",
+                "prepare": prep_report,
+            }
+
+        post_prep_files = list(prep_report.get("post_prepare_changed_files") or [])
+        if int(state.get("execution_attempts", 0)) == 0:
+            state["pre_builder_file_hashes"] = _hash_worktree_files(worktree_path, post_prep_files)
+        merged_allowed = sorted(
+            set(state.get("pre_prepare_allowed_files") or [])
+            | set(prep_report.get("generated_allowed_files") or [])
+        )
+        state["pre_prepare_allowed_files"] = merged_allowed
+        state["env_prepared"] = True
+
+        if refresh_boundary_on_explicit_prepare and state.get("locked_sandbox_boundary") is not None:
+            # Explicit upper-layer prepare_task refreshes configured boundary (still strictly workspace-write)
+            refreshed = self._compute_config_sandbox_boundary(tdir, worktree_path, cfg)
+            state["locked_sandbox_boundary"] = refreshed
+            state["sandbox_boundary"] = {k: v for k, v in refreshed.items() if k != "extra_add_dirs"}
+
+        if state["status"] == STATE_BLOCKED and state.get("failure_category") in {
+            "dependency_prepare_failure",
+            "environment_failure",
+        }:
+            state["env_retry_count"] = 0
+            state["environment_error"] = None
+            resume_state = STATE_REVISING if int(state.get("repair_round", 0)) > 0 else STATE_PLANNED
+            self.store.transition(
+                tid,
+                state,
+                resume_state,
+                event_type="environment_unblocked",
+                message="Environment preparation succeeded; task unblocked and ready for Builder execution.",
+                details={"resumed_to": resume_state},
+            )
+        else:
+            self.store.save_state(tid, state)
+
+        return {"ok": True, "prepare": prep_report}
+
     def execute_round(
         self,
         task_id: str | None,
@@ -530,8 +793,10 @@ class Orchestrator:
         timeout_sec: int | None = None,
         idle_timeout_sec: int | None = None,
         escalate_model: bool = False,
+        prepare_commands: list[str] | None = None,
+        prepare_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Run Codex CLI Builder inside the isolated worktree for the current round."""
+        """Run pre-Builder readiness gate, then execute Codex CLI Builder inside the isolated worktree."""
         tid = self.resolve_task_id(task_id)
         tdir = self.store.task_dir(tid)
 
@@ -540,8 +805,9 @@ class Orchestrator:
             state = self.store.load_state(tid)
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
             hints = read_local_codex_hints()
+            worktree_path = Path(meta["worktree_path"])
 
-            # Verify immutable plan contract before invoking Builder
+            # 1. Verify immutable plan contract before anything else
             contract_check = verify_contract_integrity(tdir)
             if not contract_check["valid"]:
                 self.store.transition(
@@ -555,9 +821,54 @@ class Orchestrator:
                 )
                 return {"ok": False, "task_id": tid, "state": state, "error": contract_check["reason"]}
 
+            # 2. Enforce pre-Builder environment & dependency readiness gate (NEVER start Builder if unprepared)
+            if not state.get("env_prepared", False) or prepare_commands is not None:
+                prep_res = self._run_pre_prepare_locked(
+                    tid,
+                    tdir,
+                    meta,
+                    state,
+                    cfg,
+                    prepare_commands=prepare_commands,
+                    explicit_env=prepare_env,
+                )
+                if not prep_res["ok"]:
+                    return {
+                        "ok": False,
+                        "stage": "prepare",
+                        "next_action": "blocked_dependency_prepare",
+                        "task_id": tid,
+                        "prepare": prep_res["prepare"],
+                        "state": state,
+                    }
+
+            # 3. Lock immutable sandbox boundary on initial execution; never expand permissions on retries
+            configured_boundary = self._compute_config_sandbox_boundary(tdir, worktree_path, cfg)
+            locked_raw = state.get("locked_sandbox_boundary")
+            if not isinstance(locked_raw, dict):
+                locked_raw = configured_boundary
+                state["locked_sandbox_boundary"] = locked_raw
+            sandbox_mode = validate_sandbox_mode(locked_raw.get("sandbox_mode"))
+            locked_network_access = bool(locked_raw.get("network_access", False))
+            locked_extra_add_dirs = list(locked_raw.get("extra_add_dirs") or [])
+            locked_isolation = str(locked_raw.get("builder_isolation") or "strict")
+            _, _, locked_writable_dirs = resolve_builder_writable_dirs(tdir, worktree_path, locked_extra_add_dirs)
+            public_boundary = {
+                "sandbox_mode": sandbox_mode,
+                "network_access": locked_network_access,
+                "writable_dirs": locked_writable_dirs,
+                "builder_isolation": locked_isolation,
+            }
+            state["sandbox_boundary"] = public_boundary
+
             repair_round = int(state.get("repair_round", 0))
-            should_escalate = escalate_model or (repair_round > 0 and state["model_policy"].get("mode") == "auto")
             prev_failure_category = state.get("failure_category")
+            non_escalating_prev = prev_failure_category in {"environment_failure", "dependency_prepare_failure"}
+            should_escalate = escalate_model or (
+                repair_round > 0
+                and state["model_policy"].get("mode") == "auto"
+                and not non_escalating_prev
+            )
 
             try:
                 selection = select_model_for_round(
@@ -586,21 +897,20 @@ class Orchestrator:
             if selection.reasoning_effort:
                 state["model_policy"]["current_reasoning_effort"] = selection.reasoning_effort
                 state["model_policy"]["reasoning_effort"] = selection.reasoning_effort
-            attempt_num = int(state.get("execution_attempts", 0)) + 1
-            state["execution_attempts"] = attempt_num
 
+            next_attempt_preview = int(state.get("execution_attempts", 0)) + 1
             self.store.transition(
                 tid,
                 state,
                 STATE_EXECUTING,
                 event_type="builder_started",
                 message=(
-                    f"Handing off to Codex CLI Builder (round {repair_round}, attempt {attempt_num}, "
+                    f"Handing off to Codex CLI Builder (round {repair_round}, attempt {next_attempt_preview}, "
                     f"model={selection.model}, effort={selection.reasoning_effort or 'default'}): {selection.reason}"
                 ),
                 details={
                     "round": repair_round,
-                    "attempt": attempt_num,
+                    "attempt": next_attempt_preview,
                     "model": selection.model,
                     "reasoning_effort": selection.reasoning_effort,
                     "mode": selection.mode,
@@ -608,62 +918,16 @@ class Orchestrator:
                     "effort_locked": selection.effort_locked,
                     "escalated_from": selection.escalated_from,
                     "effort_escalated_from": selection.effort_escalated_from,
+                    "sandbox_boundary": public_boundary,
                 },
             )
 
             plan_text = (tdir / "PLAN.md").read_text(encoding="utf-8")
             contract_doc = read_json(tdir / "contract.json") or {}
-            raw_builder_checks = list(contract_doc.get("builder_checks") or [])
+            builder_checks = list(contract_doc.get("builder_checks") or [])
             builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
-            builder_network_access = bool(builder_cfg.get("network_access", False))
-            sandbox_mode = str(cfg.get("sandbox_mode") or "workspace-write")
             feedback_path = tdir / "FEEDBACK.md"
             feedback_text = feedback_path.read_text(encoding="utf-8") if feedback_path.is_file() else None
-            worktree_path = Path(meta["worktree_path"])
-
-            filter_res = filter_builder_checks_for_sandbox(
-                raw_builder_checks,
-                worktree_path,
-                sandbox_mode=sandbox_mode,
-                builder_network_access=builder_network_access,
-                auto_filter=bool(builder_cfg.get("auto_filter_sandbox_tests", True)),
-                extra_skip_tests=builder_cfg.get("skip_tests") if isinstance(builder_cfg.get("skip_tests"), list) else None,
-            )
-            builder_checks = filter_res["checks"]
-            deferred_sandbox_tests = filter_res["deferred_tests"]
-            if filter_res["rewritten"]:
-                self.store.append_event(
-                    tid,
-                    phase="execute",
-                    agent="Orchestrator",
-                    event_type="builder_checks_filtered",
-                    message=(
-                        f"Auto-deferred {len(deferred_sandbox_tests)} socket/loopback test(s) from sandbox Builder Checks "
-                        f"to host verification: {', '.join(deferred_sandbox_tests[:8])}"
-                    ),
-                    details={
-                        "deferred_tests": deferred_sandbox_tests,
-                        "filtered_checks": builder_checks,
-                    },
-                )
-
-            planned_manifests = (
-                detect_plan_dependency_manifests(contract_doc.get("target_files"))
-                if (sandbox_mode == "workspace-write" and not builder_network_access and repair_round == 0)
-                else []
-            )
-
-            prompt = build_codex_prompt(
-                task_name=meta["name"],
-                plan_text=plan_text,
-                feedback_text=feedback_text,
-                repair_round=repair_round,
-                worktree_path=worktree_path,
-                builder_checks=builder_checks or None,
-                builder_network_access=builder_network_access,
-                deferred_sandbox_tests=deferred_sandbox_tests or None,
-                planned_dependency_manifests=planned_manifests or None,
-            )
 
             eff_timeout, eff_idle_timeout = resolve_codex_timeouts(
                 cfg,
@@ -678,77 +942,117 @@ class Orchestrator:
                 state["token_usage"] = _merge_token_totals(state.get("token_usage"), usage)
                 self.store.save_state(tid, state)
 
-            outcome = run_codex_exec(
-                store=self.store,
-                task_id=tid,
-                worktree_path=worktree_path,
-                codex_binary=codex_bin,
-                model=selection.model,
-                sandbox_mode=sandbox_mode,
-                reasoning_effort=selection.reasoning_effort,
-                prompt=prompt,
-                timeout_sec=eff_timeout,
-                repair_round=repair_round,
-                attempt=attempt_num,
-                idle_timeout_sec=eff_idle_timeout,
-                post_turn_grace_sec=float(cfg.get("codex_post_turn_grace_sec", 4)),
-                active_grace_sec=int(cfg.get("codex_active_grace_sec", 300)),
-                active_grace_window_sec=int(cfg.get("codex_active_grace_window_sec", 60)),
-                max_active_extensions=int(cfg.get("codex_max_active_extensions", 2)),
-                builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
-                builder_add_dirs=cfg.get("builder_add_dirs") if isinstance(cfg.get("builder_add_dirs"), list) else None,
-                builder_isolation=str(cfg.get("builder_isolation") or "strict"),
-                builder_network_access=builder_network_access,
-                on_token_usage=_live_usage_cb,
-            )
+            def _run_single_builder_attempt(
+                *,
+                env_retry_feedback: str | None = None,
+                is_env_retry: bool = False,
+            ) -> CodexRunOutcome:
+                attempt_num = int(state.get("execution_attempts", 0)) + 1
+                state["execution_attempts"] = attempt_num
+                self.store.save_state(tid, state)
 
-            # Finalize per-attempt token completeness metadata
-            state["token_usage"] = _record_attempt_token_accounting(
-                state.get("token_usage"),
-                exact_usage=outcome.token_usage,
-                estimated_usage=outcome.estimated_token_usage,
-            )
+                prompt = build_codex_prompt(
+                    task_name=meta["name"],
+                    plan_text=plan_text,
+                    feedback_text=feedback_text,
+                    repair_round=repair_round,
+                    worktree_path=worktree_path,
+                    writable_dirs=locked_writable_dirs,
+                    builder_checks=builder_checks or None,
+                    builder_network_access=locked_network_access,
+                    env_retry_feedback=env_retry_feedback,
+                )
 
-            # Record model history entry with final round token usage
-            history_entry = make_model_history_entry(
-                round_num=repair_round,
-                role="builder",
-                selection=selection,
-                token_usage=outcome.token_usage,
-            )
-            history_entry["attempt"] = attempt_num
-            if outcome.token_usage is None and outcome.estimated_token_usage is not None:
-                history_entry["estimated_token_usage"] = outcome.estimated_token_usage
-            state.setdefault("model_history", []).append(history_entry)
+                att_outcome = run_codex_exec(
+                    store=self.store,
+                    task_id=tid,
+                    worktree_path=worktree_path,
+                    codex_binary=codex_bin,
+                    model=selection.model,
+                    sandbox_mode=sandbox_mode,
+                    reasoning_effort=selection.reasoning_effort,
+                    prompt=prompt,
+                    timeout_sec=eff_timeout,
+                    repair_round=repair_round,
+                    attempt=attempt_num,
+                    idle_timeout_sec=eff_idle_timeout,
+                    post_turn_grace_sec=float(cfg.get("codex_post_turn_grace_sec", 4)),
+                    active_grace_sec=int(cfg.get("codex_active_grace_sec", 300)),
+                    active_grace_window_sec=int(cfg.get("codex_active_grace_window_sec", 60)),
+                    max_active_extensions=int(cfg.get("codex_max_active_extensions", 2)),
+                    builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
+                    builder_add_dirs=locked_extra_add_dirs or None,
+                    builder_isolation=locked_isolation,
+                    builder_network_access=locked_network_access,
+                    on_token_usage=_live_usage_cb,
+                )
 
-            # Update diff stats snapshot after Builder run
-            try:
-                diff_info = inspect_worktree_changes(worktree_path, meta["base_commit"], include_diff=False)
-                state["diff_stats"] = {
-                    "files_changed_count": diff_info["files_changed_count"],
-                    "total_insertions": diff_info["total_insertions"],
-                    "total_deletions": diff_info["total_deletions"],
-                    "added": diff_info["added"],
-                    "modified": diff_info["modified"],
-                    "deleted": diff_info["deleted"],
-                    "renamed": diff_info["renamed"],
-                    "untracked": diff_info["untracked"],
-                    "files": diff_info["files"],
-                }
-            except Exception:
-                pass
+                state["token_usage"] = _record_attempt_token_accounting(
+                    state.get("token_usage"),
+                    exact_usage=att_outcome.token_usage,
+                    estimated_usage=att_outcome.estimated_token_usage,
+                )
 
-            self.store.append_execution_log(
-                tid,
-                f"Builder Round {repair_round} Attempt {attempt_num} ({selection.model})",
-                f"- Exit code: `{outcome.exit_code}` | Duration: `{outcome.duration_sec}s` "
-                f"(timeout={eff_timeout}s, idle_timeout={eff_idle_timeout}s)\n"
-                f"- Timed out: `{outcome.timed_out}` ({outcome.timeout_reason or 'n/a'}) | Cancelled: `{outcome.cancelled}`\n"
-                f"- JSONL log: `{outcome.raw_jsonl_path}`\n"
-                f"- Selection rationale: {selection.reason}\n"
-                f"- Token usage: `{outcome.token_usage or 'unavailable'}`\n"
-                f"- Summary: {(outcome.structured_result or {}).get('summary') or outcome.error_message or 'N/A'}\n",
-            )
+                if is_env_retry:
+                    history_entry = make_model_history_entry(
+                        round_num=repair_round,
+                        role="builder",
+                        model_name=selection.model,
+                        mode=selection.mode,
+                        reason=(
+                            f"Environment retry {state.get('env_retry_count', 1)}/{state.get('max_env_retries', 1)} "
+                            f"retaining model '{selection.model}' and effort '{selection.reasoning_effort}' (no escalation, permissions unchanged)."
+                        ),
+                        token_usage=att_outcome.token_usage,
+                    )
+                    history_entry["locked"] = selection.locked
+                    history_entry["reasoning_effort"] = selection.reasoning_effort
+                    history_entry["env_retry"] = True
+                else:
+                    history_entry = make_model_history_entry(
+                        round_num=repair_round,
+                        role="builder",
+                        selection=selection,
+                        token_usage=att_outcome.token_usage,
+                    )
+                    history_entry["env_retry"] = False
+                history_entry["attempt"] = attempt_num
+                if att_outcome.token_usage is None and att_outcome.estimated_token_usage is not None:
+                    history_entry["estimated_token_usage"] = att_outcome.estimated_token_usage
+                state.setdefault("model_history", []).append(history_entry)
+
+                try:
+                    diff_info = inspect_worktree_changes(worktree_path, meta["base_commit"], include_diff=False)
+                    state["diff_stats"] = {
+                        "files_changed_count": diff_info["files_changed_count"],
+                        "total_insertions": diff_info["total_insertions"],
+                        "total_deletions": diff_info["total_deletions"],
+                        "added": diff_info["added"],
+                        "modified": diff_info["modified"],
+                        "deleted": diff_info["deleted"],
+                        "renamed": diff_info["renamed"],
+                        "untracked": diff_info["untracked"],
+                        "files": diff_info["files"],
+                    }
+                except Exception:
+                    pass
+
+                retry_tag = " [Environment Retry]" if is_env_retry else ""
+                self.store.append_execution_log(
+                    tid,
+                    f"Builder Round {repair_round} Attempt {attempt_num}{retry_tag} ({selection.model})",
+                    f"- Exit code: `{att_outcome.exit_code}` | Duration: `{att_outcome.duration_sec}s` "
+                    f"(timeout={eff_timeout}s, idle_timeout={eff_idle_timeout}s)\n"
+                    f"- Sandbox: `{sandbox_mode}` (network_access=`{locked_network_access}`)\n"
+                    f"- Timed out: `{att_outcome.timed_out}` ({att_outcome.timeout_reason or 'n/a'}) | Cancelled: `{att_outcome.cancelled}`\n"
+                    f"- JSONL log: `{att_outcome.raw_jsonl_path}`\n"
+                    f"- Selection rationale: {history_entry['reason']}\n"
+                    f"- Token usage: `{att_outcome.token_usage or 'unavailable'}`\n"
+                    f"- Summary: {(att_outcome.structured_result or {}).get('summary') or att_outcome.error_message or 'N/A'}\n",
+                )
+                return att_outcome
+
+            outcome = _run_single_builder_attempt(is_env_retry=False)
 
             if outcome.cancelled:
                 self.store.transition(
@@ -761,6 +1065,175 @@ class Orchestrator:
                     last_error=outcome.error_message,
                 )
                 return {"ok": False, "task_id": tid, "outcome": outcome.__dict__, "state": state}
+
+            # 4. Separate Environment Exception Handling (max 1 automatic retry, no model escalation, no permission expansion, no repair_round consumed)
+            env_exc = classify_environment_exception(outcome)
+            if env_exc is not None:
+                first_env_exc = env_exc
+                jsonl_paths = [outcome.raw_jsonl_path]
+                env_retry_count = int(state.get("env_retry_count", 0))
+                max_env_retries = min(1, max(0, int(state.get("max_env_retries", 1))))
+
+                self.store.append_event(
+                    tid,
+                    phase="execute",
+                    agent="Orchestrator",
+                    event_type="environment_exception_detected",
+                    message=f"Detected Builder environment exception ({first_env_exc['kind']}): {first_env_exc['detail'][:240]}",
+                    details={
+                        "kind": first_env_exc["kind"],
+                        "source": first_env_exc["source"],
+                        "env_retry_count": env_retry_count,
+                        "max_env_retries": max_env_retries,
+                        "repair_round": repair_round,
+                    },
+                )
+
+                final_env_exc: dict[str, Any] | None = first_env_exc
+                if env_retry_count < max_env_retries:
+                    state["env_retry_count"] = env_retry_count + 1
+                    changed_paths = [
+                        str(f["path"])
+                        for f in (state.get("diff_stats") or {}).get("files", [])
+                        if isinstance(f, dict) and f.get("path")
+                    ]
+                    env_fb = _format_env_retry_feedback(
+                        first_env_exc,
+                        changed_files=changed_paths,
+                        writable_dirs=locked_writable_dirs,
+                        network_access=locked_network_access,
+                    )
+                    atomic_write_text(tdir / "ENV_RETRY_CONTEXT.md", env_fb + "\n")
+                    self.store.append_event(
+                        tid,
+                        phase="execute",
+                        agent="Orchestrator",
+                        event_type="environment_retry_started",
+                        message=(
+                            f"Starting environment retry {state['env_retry_count']}/{max_env_retries} "
+                            f"(model={selection.model}, effort={selection.reasoning_effort}, repair_round={repair_round} unchanged, permissions unchanged)."
+                        ),
+                        details={
+                            "env_retry_count": state["env_retry_count"],
+                            "max_env_retries": max_env_retries,
+                            "repair_round": repair_round,
+                            "model": selection.model,
+                            "reasoning_effort": selection.reasoning_effort,
+                            "sandbox_boundary": public_boundary,
+                            "first_error": first_env_exc,
+                        },
+                    )
+
+                    outcome = _run_single_builder_attempt(env_retry_feedback=env_fb, is_env_retry=True)
+                    jsonl_paths.append(outcome.raw_jsonl_path)
+
+                    if outcome.cancelled:
+                        self.store.transition(
+                            tid,
+                            state,
+                            STATE_BLOCKED,
+                            event_type="builder_cancelled",
+                            message=outcome.error_message or "Builder execution cancelled.",
+                            failure_category="cancelled",
+                            last_error=outcome.error_message,
+                        )
+                        return {"ok": False, "task_id": tid, "outcome": outcome.__dict__, "state": state}
+
+                    retry_env_exc = classify_environment_exception(outcome)
+                    if retry_env_exc is None and outcome.ok:
+                        final_env_exc = None
+                        state["environment_error"] = None
+                        self.store.append_event(
+                            tid,
+                            phase="execute",
+                            agent="Orchestrator",
+                            event_type="environment_retry_succeeded",
+                            message=(
+                                f"Environment retry {state['env_retry_count']}/{max_env_retries} succeeded "
+                                f"without model escalation or permission expansion."
+                            ),
+                            details={
+                                "env_retry_count": state["env_retry_count"],
+                                "repair_round": repair_round,
+                            },
+                        )
+                    else:
+                        final_env_exc = retry_env_exc or {
+                            "kind": first_env_exc["kind"],
+                            "detail": (outcome.error_message or first_env_exc["detail"])[:800],
+                            "source": "retry_failed",
+                            "failed_commands": [],
+                        }
+
+                if final_env_exc is not None:
+                    changed_paths = [
+                        str(f["path"])
+                        for f in (state.get("diff_stats") or {}).get("files", [])
+                        if isinstance(f, dict) and f.get("path")
+                    ]
+                    env_report = {
+                        "reported_at": utc_now(),
+                        "kind": final_env_exc["kind"],
+                        "detail": final_env_exc["detail"],
+                        "first_error": first_env_exc,
+                        "retry_error": final_env_exc if len(jsonl_paths) > 1 else None,
+                        "env_retry_count": int(state.get("env_retry_count", 0)),
+                        "max_env_retries": max_env_retries,
+                        "repair_round": repair_round,
+                        "repair_round_consumed": False,
+                        "model": selection.model,
+                        "reasoning_effort": selection.reasoning_effort,
+                        "model_escalated": False,
+                        "permission_expanded": False,
+                        "sandbox_boundary": public_boundary,
+                        "worktree_path": str(worktree_path),
+                        "worktree_preserved": worktree_path.is_dir(),
+                        "files_changed_count": int((state.get("diff_stats") or {}).get("files_changed_count", 0)),
+                        "files_changed": changed_paths,
+                        "raw_jsonl_paths": jsonl_paths,
+                        "result_file_path": outcome.result_file_path,
+                        "execution_log_path": str(tdir / "EXECUTION_LOG.md"),
+                    }
+                    atomic_write_json(tdir / "ENVIRONMENT_REPORT.json", env_report)
+                    state["environment_error"] = env_report
+                    err_headline = f"[{final_env_exc['kind']}] {final_env_exc['detail']}"
+                    self.store.append_execution_log(
+                        tid,
+                        "Environment Exception Escalated to Antigravity",
+                        f"- Kind: `{final_env_exc['kind']}`\n"
+                        f"- Environment retries used: `{state['env_retry_count']}/{max_env_retries}` (Repair round preserved at `{repair_round}`)\n"
+                        f"- Worktree preserved: `{worktree_path}` ({len(changed_paths)} changed file(s))\n"
+                        f"- First error: {first_env_exc['detail']}\n"
+                        + (f"- Retry error: {final_env_exc['detail']}\n" if len(jsonl_paths) > 1 else ""),
+                    )
+                    self.store.transition(
+                        tid,
+                        state,
+                        STATE_BLOCKED,
+                        event_type="environment_blocked",
+                        message=(
+                            f"Builder blocked by environment exception after {state['env_retry_count']}/{max_env_retries} "
+                            f"retry(s); escalating to Antigravity: {err_headline[:300]}"
+                        ),
+                        agent="Antigravity (Architect)",
+                        failure_category="environment_failure",
+                        last_error=err_headline[:800],
+                        details={
+                            "kind": final_env_exc["kind"],
+                            "env_retry_count": state["env_retry_count"],
+                            "max_env_retries": max_env_retries,
+                            "repair_round": repair_round,
+                            "worktree_preserved": True,
+                        },
+                    )
+                    return {
+                        "ok": False,
+                        "next_action": "blocked_environment",
+                        "task_id": tid,
+                        "outcome": outcome.__dict__,
+                        "environment_report": env_report,
+                        "state": state,
+                    }
 
             if not outcome.ok:
                 target_st = STATE_BLOCKED if outcome.failure_category == "builder_blocked" else STATE_FAILED
@@ -776,12 +1249,18 @@ class Orchestrator:
                 )
                 return {"ok": False, "task_id": tid, "outcome": outcome.__dict__, "state": state}
 
-            # Deterministic post-execution invariant guard: reject partial/no-op exits before verify
+            # 5. Deterministic post-execution invariant guard: reject partial/no-op exits before verify
             allow_empty_diff = bool(builder_cfg.get("allow_empty_diff", False))
+            builder_delta_count = _count_builder_delta_files(
+                worktree_path,
+                state.get("diff_stats"),
+                state.get("pre_builder_file_hashes") if isinstance(state.get("pre_builder_file_hashes"), dict) else None,
+            )
             inv_category, inv_reason = _check_post_execution_invariants(
                 outcome.structured_result,
                 state.get("diff_stats"),
                 allow_empty_diff=allow_empty_diff,
+                effective_files_changed=builder_delta_count,
             )
             if inv_category is not None and inv_reason is not None:
                 max_repairs = int(state.get("max_repair_rounds", 3))
@@ -866,53 +1345,30 @@ class Orchestrator:
         prepare_commands: list[str] | None = None,
         timeout_sec: int | None = None,
     ) -> dict[str, Any]:
-        """Run non-sandbox dependency preparation (e.g. go mod tidy) explicitly without burning a repair round."""
+        """Run pre-Builder environment & dependency preparation explicitly without burning a repair round."""
         tid = self.resolve_task_id(task_id)
         tdir = self.store.task_dir(tid)
         with self.store.acquire_write_lock(tid):
             meta = self.store.load_task_meta(tid)
             state = self.store.load_state(tid)
             cfg = load_config(repo_path=Path(meta["repo_path"]), home_dir=self.home_dir)
-            explicit_prep = (
-                prepare_commands
-                if prepare_commands is not None
-                else (meta.get("explicit_prepare_commands") or None)
-            )
-            prep_report = run_dependency_prepare(
-                task_dir=tdir,
-                worktree_path=Path(meta["worktree_path"]),
-                base_commit=meta["base_commit"],
-                config=cfg,
-                explicit_commands=explicit_prep,
+            prep_res = self._run_pre_prepare_locked(
+                tid,
+                tdir,
+                meta,
+                state,
+                cfg,
+                prepare_commands=prepare_commands,
                 timeout_sec=timeout_sec,
+                refresh_boundary_on_explicit_prepare=True,
             )
-            if prep_report["ran"]:
-                self.store.append_event(
-                    tid,
-                    phase="verify",
-                    agent="Orchestrator (Verifier)",
-                    event_type="prepare_completed" if prep_report["passed"] else "prepare_failed",
-                    message=(
-                        f"Dependency preparation {'passed' if prep_report['passed'] else 'failed'} "
-                        f"({prep_report['commands_passed']}/{prep_report['commands_total']} commands, source={prep_report['command_source']})."
-                    ),
-                    details={
-                        "commands_passed": prep_report["commands_passed"],
-                        "commands_total": prep_report["commands_total"],
-                        "source": prep_report["command_source"],
-                    },
-                )
-                self.store.append_execution_log(
-                    tid,
-                    f"Dependency Preparation ({'PASSED' if prep_report['passed'] else 'FAILED'})",
-                    f"- Source: `{prep_report['command_source']}` | Passed: `{prep_report['commands_passed']}/{prep_report['commands_total']}`\n"
-                    + (
-                        "- Failures:\n" + "\n".join(f"  - {r}" for r in prep_report["failure_reasons"]) + "\n"
-                        if prep_report["failure_reasons"]
-                        else ""
-                    ),
-                )
-            return {"ok": prep_report["passed"], "task_id": tid, "report": prep_report, "state": state}
+            return {
+                "ok": prep_res["ok"],
+                "next_action": "ready_to_execute" if prep_res["ok"] else "blocked_dependency_prepare",
+                "task_id": tid,
+                "report": prep_res["prepare"],
+                "state": state,
+            }
 
     def verify_task(
         self,
@@ -988,35 +1444,34 @@ class Orchestrator:
                 except OSError:
                     pass
 
-            # Non-sandbox dependency preparation (e.g. go mod tidy when go.mod changed)
+            # Post-Builder dependency tidy (e.g. go mod tidy when go.mod changed)
             prep_report: dict[str, Any] | None = None
-            extra_allowed_files: list[str] = []
+            extra_allowed_files: list[str] = list(state.get("pre_prepare_allowed_files") or [])
             if not skip_prepare:
-                explicit_prep = (
-                    prepare_commands
-                    if prepare_commands is not None
-                    else (meta.get("explicit_prepare_commands") or None)
-                )
                 prep_report = run_dependency_prepare(
                     task_dir=tdir,
                     worktree_path=Path(meta["worktree_path"]),
                     base_commit=meta["base_commit"],
                     config=cfg,
-                    explicit_commands=explicit_prep,
+                    explicit_commands=prepare_commands,
                     explicit_env=effective_verify_env or None,
+                    phase="post",
                 )
                 if prep_report["ran"]:
-                    extra_allowed_files = list(prep_report.get("generated_allowed_files") or [])
+                    extra_allowed_files = sorted(
+                        set(extra_allowed_files) | set(prep_report.get("generated_allowed_files") or [])
+                    )
                     self.store.append_event(
                         tid,
                         phase="verify",
                         agent="Orchestrator (Verifier)",
                         event_type="prepare_completed" if prep_report["passed"] else "prepare_failed",
                         message=(
-                            f"Non-sandbox dependency preparation {'passed' if prep_report['passed'] else 'failed'} "
+                            f"Post-Builder dependency tidy {'passed' if prep_report['passed'] else 'failed'} "
                             f"({prep_report['commands_passed']}/{prep_report['commands_total']}, source={prep_report['command_source']})."
                         ),
                         details={
+                            "phase": "post",
                             "source": prep_report["command_source"],
                             "commands_passed": prep_report["commands_passed"],
                             "commands_total": prep_report["commands_total"],
@@ -1024,7 +1479,7 @@ class Orchestrator:
                     )
                     self.store.append_execution_log(
                         tid,
-                        f"Dependency Preparation ({'PASSED' if prep_report['passed'] else 'FAILED'})",
+                        f"Post-Builder Dependency Tidy ({'PASSED' if prep_report['passed'] else 'FAILED'})",
                         f"- Source: `{prep_report['command_source']}` | Passed: `{prep_report['commands_passed']}/{prep_report['commands_total']}`\n"
                         + (
                             "- Failures:\n" + "\n".join(f"  - {r}" for r in prep_report["failure_reasons"]) + "\n"
@@ -1033,7 +1488,7 @@ class Orchestrator:
                         ),
                     )
                     if not prep_report["passed"]:
-                        err_msg = "; ".join(prep_report["failure_reasons"])[:800] or "Dependency preparation failed."
+                        err_msg = "; ".join(prep_report["failure_reasons"])[:800] or "Post-Builder dependency tidy failed."
                         # Do NOT burn a code-repair round on external dependency/network preparation errors
                         self.store.transition(
                             tid,
@@ -1041,11 +1496,11 @@ class Orchestrator:
                             STATE_BLOCKED,
                             event_type="dependency_prepare_blocked",
                             message=(
-                                f"Dependency preparation failed outside sandbox (repair round not consumed): {err_msg}"
+                                f"Post-Builder dependency tidy failed outside sandbox (repair round not consumed): {err_msg}"
                             ),
                             failure_category="dependency_prepare_failure",
                             last_error=err_msg,
-                            details={"prepare": prep_report},
+                            details={"stage": "post_execute", "prepare": prep_report},
                         )
                         return {
                             "ok": False,
@@ -1220,7 +1675,7 @@ class Orchestrator:
         skip_prepare: bool = False,
         verify_timeout_sec: int | None = None,
     ) -> dict[str, Any]:
-        """Run one deterministic Execute -> Prepare -> Verify cycle."""
+        """Run one deterministic Pre-Prepare -> Execute -> Post-Tidy -> Verify cycle."""
         parsed_verify_env = parse_env_assignments(verify_env)
         exec_res = self.execute_round(
             task_id,
@@ -1228,26 +1683,33 @@ class Orchestrator:
             override_effort=override_effort,
             timeout_sec=codex_timeout_sec,
             idle_timeout_sec=codex_idle_timeout_sec,
+            prepare_commands=prepare_commands,
+            prepare_env=parsed_verify_env or None,
         )
         if not exec_res["ok"]:
+            stage = str(exec_res.get("stage") or "execute")
             next_action = exec_res.get("next_action") or (
                 "blocked" if exec_res["state"]["status"] == STATE_BLOCKED else "failed"
             )
-            return {
+            out: dict[str, Any] = {
                 "ok": False,
-                "stage": "execute",
+                "stage": stage,
                 "next_action": next_action,
                 "task_id": exec_res["task_id"],
-                "execution": exec_res,
+                "execution": None if stage == "prepare" else exec_res,
                 "verification": None,
                 "state": exec_res["state"],
             }
+            if stage == "prepare" and "prepare" in exec_res:
+                out["prepare"] = exec_res["prepare"]
+            if "environment_report" in exec_res:
+                out["environment_report"] = exec_res["environment_report"]
+            return out
 
         ver_res = self.verify_task(
             exec_res["task_id"],
             verify_commands=verify_commands,
             verify_env=parsed_verify_env or None,
-            prepare_commands=prepare_commands,
             skip_prepare=skip_prepare,
             timeout_sec=verify_timeout_sec,
         )
@@ -1559,6 +2021,7 @@ class Orchestrator:
         events = self.store.read_events(tid, limit=events_limit)
         verification = read_json(tdir / "verification.json")
         result = read_json(tdir / "RESULT.json")
+        environment_report = read_json(tdir / "ENVIRONMENT_REPORT.json")
         reviews = read_json(tdir / "reviews.json", default=[])
         return {
             "task": meta,
@@ -1566,6 +2029,7 @@ class Orchestrator:
             "events": events,
             "verification": verification,
             "result": result,
+            "environment_report": environment_report,
             "reviews": reviews,
         }
 

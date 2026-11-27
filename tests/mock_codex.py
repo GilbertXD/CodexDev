@@ -52,7 +52,8 @@ def main() -> int:
                 "sandbox": args.sandbox,
                 "cd": str(wt),
                 "has_feedback": "REPAIR ROUND" in prompt,
-                "has_builder_checks": "SANDBOX-SAFE BUILDER CHECKS" in prompt,
+                "has_builder_checks": "=== BUILDER CHECKS ===" in prompt,
+                "has_env_retry": "=== ENVIRONMENT RETRY CONTEXT" in prompt,
                 "prompt": prompt,
                 "prompt_len": len(prompt),
                 "add_dirs": args.add_dir,
@@ -109,7 +110,17 @@ def main() -> int:
         sys.stderr.write("Fatal: simulated unexpected termination\n")
         return 137
 
+    if scenario == "env_stderr_eperm_crash":
+        (wt / "partial_work.txt").write_text("saved before sandbox eperm\n", encoding="utf-8")
+        emit({"type": "error", "message": "sandbox-exec: operation not permitted (EPERM)"})
+        sys.stderr.write("sandbox-exec: bind 127.0.0.1: Operation not permitted (EPERM)\n")
+        return 1
+
     is_repair = "REPAIR ROUND" in prompt
+    has_env_retry = "=== ENVIRONMENT RETRY CONTEXT" in prompt
+    res_error_type = "none"
+    res_error_detail = ""
+    custom_commands_run = None
 
     if scenario == "active_then_success":
         # Emits heartbeat events every 0.35s for ~1.4s (exceeds a 1s idle timeout ONLY if idle is broken!)
@@ -254,6 +265,46 @@ def main() -> int:
             summary = "Implemented multiply() completely on escalated repair round."
     elif scenario == "empty_diff_completed":
         summary = "Claimed completion without modifying any worktree files."
+    elif scenario == "env_perm_once_then_success":
+        if not has_env_retry:
+            (wt / "draft_progress.txt").write_text("attempt 1 work preserved\n", encoding="utf-8")
+            summary = "Blocked by offline sandbox loopback EPERM on optional HTTP probe."
+            res_error_type = "permission_denied"
+            res_error_detail = "listen tcp 127.0.0.1:0: bind: operation not permitted"
+            custom_commands_run = [
+                {
+                    "command": "python3 -c 'socket.bind((\"127.0.0.1\", 0))'",
+                    "exit_code": 1,
+                    "summary": "PermissionError: [Errno 1] Operation not permitted",
+                }
+            ]
+        else:
+            assert (wt / "draft_progress.txt").is_file(), "Expected Attempt 1 worktree changes to be preserved!"
+            (wt / "calc.py").write_text(
+                "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+                "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+                encoding="utf-8",
+            )
+            summary = "Completed implementation within workspace-write boundaries on env retry."
+    elif scenario == "env_missing_dep_until_prepared":
+        if not (wt / "dep_ready.marker").is_file():
+            (wt / "calc.py").write_text(
+                "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+                "def multiply(a: int, b: int) -> int:\n    return a * b\n",
+                encoding="utf-8",
+            )
+            summary = "Missing required pre-staged dependency in offline sandbox."
+            res_error_type = "missing_dependency"
+            res_error_detail = "missing go.sum entry for module providing package example.com/pkg/foo"
+            custom_commands_run = [
+                {
+                    "command": "go vet ./...",
+                    "exit_code": 1,
+                    "summary": "missing go.sum entry for module providing package example.com/pkg/foo",
+                }
+            ]
+        else:
+            summary = "Pre-staged dependency found; Builder checks passed."
     elif scenario == "success":
         (wt / "calc.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b\n\n"
@@ -351,12 +402,20 @@ def main() -> int:
         emit({"type": "turn.completed"})
 
     is_partial_noop = scenario == "partial_empty" or (scenario == "partial_then_success" and not is_repair)
-    if is_partial_noop:
+    if res_error_type != "none":
+        res_status = "blocked"
+        res_files = ["calc.py"] if (wt / "calc.py").is_file() else []
+        res_criteria = [
+            {"criterion": "Implement requested behavior", "met": False, "evidence": res_error_detail}
+        ]
+    elif is_partial_noop:
         res_status = "partial"
         res_files: list[str] = []
         res_criteria = [
             {"criterion": "Implement requested behavior", "met": False, "evidence": "No files were changed."}
         ]
+        res_error_type = "code_error"
+        res_error_detail = "Incomplete implementation"
     elif scenario == "empty_diff_completed":
         res_status = "completed"
         res_files = []
@@ -364,7 +423,11 @@ def main() -> int:
             {"criterion": "Implement requested behavior", "met": True, "evidence": "No-op claim"}
         ]
     else:
-        res_status = "ready_for_verify" if scenario == "ready_for_verify" else "completed"
+        res_status = (
+            "ready_for_verify"
+            if scenario in ("ready_for_verify", "env_perm_once_then_success", "env_missing_dep_until_prepared")
+            else "completed"
+        )
         res_files = ["calc.py"]
         res_criteria = [
             {"criterion": "Implement requested behavior", "met": True, "evidence": "Updated source file"}
@@ -374,9 +437,12 @@ def main() -> int:
         "status": res_status,
         "summary": summary,
         "files_changed": res_files,
-        "commands_run": [{"command": "python3 -m unittest discover -v", "exit_code": 0, "summary": "mock run"}],
+        "commands_run": custom_commands_run
+        or [{"command": "python3 -m unittest discover -v", "exit_code": 0, "summary": "mock run"}],
         "acceptance_criteria_status": res_criteria,
         "risks_or_notes": [],
+        "error_type": res_error_type,
+        "error_detail": res_error_detail,
     }
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(json.dumps(result_obj, indent=2), encoding="utf-8")

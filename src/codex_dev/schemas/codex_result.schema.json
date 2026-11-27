@@ -9,7 +9,9 @@
     "files_changed",
     "commands_run",
     "acceptance_criteria_status",
-    "risks_or_notes"
+    "risks_or_notes",
+    "error_type",
+    "error_detail"
   ],
   "properties": {
     "status": {
@@ -52,6 +54,19 @@
     "risks_or_notes": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "error_type": {
+      "type": "string",
+      "enum": [
+        "none",
+        "permission_denied",
+        "missing_dependency",
+        "environment_error",
+        "code_error"
+      ]
+    },
+    "error_detail": {
+      "type": "string"
     }
   }
 }

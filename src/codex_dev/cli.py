@@ -89,18 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--escalate", action="store_true", help="Request authorized model escalation if unlocked.")
 
     # prepare
-    prp = sub.add_parser("prepare", help="Run non-sandbox dependency preparation (e.g. go mod tidy) explicitly.")
+    prp = sub.add_parser("prepare", help="Run pre-Builder environment and dependency preparation on the host.")
     prp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     prp.add_argument("--prepare-cmd", action="append", default=None, help="Override preparation commands (repeatable).")
     prp.add_argument("--timeout", type=int, default=None, help="Per-command timeout in seconds.")
 
     # verify
-    vp = sub.add_parser("verify", help="Run non-sandbox dependency preparation and independent verification.")
+    vp = sub.add_parser("verify", help="Run post-Builder dependency tidy (if needed) and independent verification.")
     vp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     vp.add_argument("--verify-cmd", action="append", default=None, help="Override verification commands.")
     vp.add_argument("--verify-env", action="append", default=None, help="Per-run verification env override KEY=VALUE (repeatable).")
-    vp.add_argument("--prepare-cmd", action="append", default=None, help="Override non-sandbox prepare commands.")
-    vp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
+    vp.add_argument("--prepare-cmd", action="append", default=None, help="Override post-Builder tidy commands.")
+    vp.add_argument("--skip-prepare", action="store_true", help="Skip automatic post-Builder dependency tidy.")
     vp.add_argument("--timeout", type=int, default=None, help="Per-command timeout in seconds.")
     vp.add_argument(
         "--from-failed",
@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # run-round
-    rrp = sub.add_parser("run-round", help="Execute Builder, prepare dependencies outside sandbox, and verify.")
+    rrp = sub.add_parser("run-round", help="Prepare environment before Builder, execute Builder, tidy dependencies, and verify.")
     rrp.add_argument("--task-id", default=None, help="Task ID (defaults to active task).")
     rrp.add_argument("--model", default=None, help="Optional per-round authorized model override.")
     rrp.add_argument("--reasoning-effort", default=None, help="Optional per-round reasoning effort override (low/medium/high/xhigh; max/ultra disabled).")
@@ -117,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     rrp.add_argument("--codex-idle-timeout", type=int, default=None, help="Codex idle no-event timeout in seconds (0 disables).")
     rrp.add_argument("--verify-cmd", action="append", default=None, help="Explicit verification command.")
     rrp.add_argument("--verify-env", action="append", default=None, help="Per-run verification env override KEY=VALUE (repeatable).")
-    rrp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit non-sandbox prepare command.")
-    rrp.add_argument("--skip-prepare", action="store_true", help="Skip automatic non-sandbox dependency preparation.")
+    rrp.add_argument("--prepare-cmd", action="append", default=None, help="Explicit pre-Builder prepare command.")
+    rrp.add_argument("--skip-prepare", action="store_true", help="Skip automatic post-Builder dependency tidy.")
     rrp.add_argument("--verify-timeout", type=int, default=None, help="Verification command timeout in seconds.")
 
     # review

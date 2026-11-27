@@ -3,6 +3,7 @@
   "codex_binary": "codex",
   "sandbox_mode": "workspace-write",
   "max_repair_rounds": 3,
+  "max_env_retries": 1,
   "codex_timeout_sec": 600,
   "codex_idle_timeout_sec": 300,
   "codex_post_turn_grace_sec": 4,
@@ -26,8 +27,6 @@
   "builder_isolation": "strict",
   "builder": {
     "network_access": false,
-    "auto_filter_sandbox_tests": true,
-    "skip_tests": [],
     "allow_empty_diff": false
   },
   "prepare": {

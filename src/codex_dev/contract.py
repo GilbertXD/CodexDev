@@ -107,12 +107,26 @@ def parse_plan_markdown(plan_text: str) -> dict[str, Any]:
         elif item:
             prepare_commands.append(item)
 
+    environment_requirements: list[str] = []
+    for heading, lines in sections.items():
+        if any(p in heading for p in ("prepare", "预处理", "依赖准备")):
+            continue
+        if any(k in heading for k in ("environment requirement", "environment", "环境要求", "环境与依赖")):
+            for raw in lines:
+                s = raw.strip()
+                bm = re.match(r"^(?:[-*+]|\d+\.)\s+(?:\[[ xX]\]\s+)?(.+)$", s)
+                if bm:
+                    val = bm.group(1).strip()
+                    if val:
+                        environment_requirements.append(val)
+
     return {
         "acceptance_criteria": acceptance_criteria,
         "target_files": list(dict.fromkeys(target_files)),
         "verify_commands": list(dict.fromkeys(verify_commands)),
         "builder_checks": list(dict.fromkeys(builder_checks)),
         "prepare_commands": list(dict.fromkeys(prepare_commands)),
+        "environment_requirements": list(dict.fromkeys(environment_requirements)),
     }
 
 
@@ -169,6 +183,7 @@ def save_immutable_contract(
         "verify_commands": verify_cmds,
         "builder_checks": builder_checks,
         "prepare_commands": prepare_cmds,
+        "environment_requirements": parsed["environment_requirements"],
         "created_at": utc_now(),
     }
 

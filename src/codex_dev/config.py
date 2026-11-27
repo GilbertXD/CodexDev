@@ -9,11 +9,31 @@ import re
 from pathlib import Path
 from typing import Any
 
+ENFORCED_SANDBOX_MODE = "workspace-write"
+
+
+class SandboxSecurityError(ValueError):
+    """Raised when configuration or caller attempts to weaken the immutable Builder sandbox."""
+
+
+def validate_sandbox_mode(sandbox_mode: Any) -> str:
+    """Enforce that Builder always runs inside the `workspace-write` sandbox."""
+    mode = str(sandbox_mode).strip() if sandbox_mode is not None else ""
+    if mode != ENFORCED_SANDBOX_MODE:
+        raise SandboxSecurityError(
+            f"Security boundary violation: Builder sandbox_mode is immutably locked to "
+            f"'{ENFORCED_SANDBOX_MODE}' (got {sandbox_mode!r}). Downgrading to 'danger-full-access' "
+            "or other sandbox modes is strictly prohibited."
+        )
+    return ENFORCED_SANDBOX_MODE
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "codex_binary": "codex",
-    "sandbox_mode": "workspace-write",
+    "sandbox_mode": ENFORCED_SANDBOX_MODE,
     "max_repair_rounds": 3,
+    "max_env_retries": 1,
     "codex_timeout_sec": 600,
     "codex_idle_timeout_sec": 300,
     "codex_post_turn_grace_sec": 4,
@@ -37,8 +57,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "builder_isolation": "strict",
     "builder": {
         "network_access": False,
-        "auto_filter_sandbox_tests": True,
-        "skip_tests": [],
         "allow_empty_diff": False,
     },
     "prepare": {
@@ -257,6 +275,7 @@ def load_config(repo_path: Path | None = None, home_dir: Path | None = None) -> 
     if env_bin:
         cfg["codex_binary"] = env_bin
 
+    cfg["sandbox_mode"] = validate_sandbox_mode(cfg.get("sandbox_mode"))
     return cfg
 
 

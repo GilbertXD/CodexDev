@@ -39,6 +39,7 @@ export interface MonitorSnapshot {
   events: Array<Record<string, unknown>>;
   verification: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
+  environment_report: Record<string, unknown> | null;
   reviews: Array<Record<string, unknown>>;
   revision: string;
 }
@@ -227,6 +228,7 @@ export function readMonitorSnapshot(requestedTaskId?: string, eventsLimit = 80):
   let events: Array<Record<string, unknown>> = [];
   let verification: Record<string, unknown> | null = null;
   let result: Record<string, unknown> | null = null;
+  let environmentReport: Record<string, unknown> | null = null;
   let reviews: Array<Record<string, unknown>> = [];
   let revision = `empty:${tasks.length}`;
 
@@ -237,6 +239,7 @@ export function readMonitorSnapshot(requestedTaskId?: string, eventsLimit = 80):
     events = safeReadEvents(join(tdir, "events.jsonl"), Math.min(Math.max(eventsLimit, 10), 200));
     verification = safeReadJson<Record<string, unknown> | null>(join(tdir, "verification.json"), null);
     result = safeReadJson<Record<string, unknown> | null>(join(tdir, "RESULT.json"), null);
+    environmentReport = safeReadJson<Record<string, unknown> | null>(join(tdir, "ENVIRONMENT_REPORT.json"), null);
     reviews = safeReadJson<Array<Record<string, unknown>>>(join(tdir, "reviews.json"), []);
     revision = [
       selectedTaskId,
@@ -259,6 +262,7 @@ export function readMonitorSnapshot(requestedTaskId?: string, eventsLimit = 80):
     events,
     verification,
     result,
+    environment_report: environmentReport,
     reviews,
     revision,
   };
@@ -286,7 +290,7 @@ export function formatPlainTextSummary(snapshot: MonitorSnapshot): string {
     `Status: ${String(s.status)} | Phase: ${String(s.current_phase)} | Agent: ${String(s.current_agent)}`,
     `Branch: ${String(t.branch || "-")} | Worktree: ${String(t.worktree_path || "-")}`,
     `Builder Model: ${String(mp.current_model || "-")} (${String(mp.mode || "auto")}${mp.locked ? ", locked" : ""}${mp.current_reasoning_effort || mp.reasoning_effort ? `, effort=${String(mp.current_reasoning_effort || mp.reasoning_effort)}${mp.effort_locked ? " locked" : ""}` : ""})`,
-    `Repair Round: ${String(s.repair_round ?? 0)} / ${String(s.max_repair_rounds ?? 3)}`,
+    `Repair Round: ${String(s.repair_round ?? 0)} / ${String(s.max_repair_rounds ?? 3)} | Env Retry: ${String(s.env_retry_count ?? 0)} / ${String(s.max_env_retries ?? 1)}`,
     `Diff: ${String(diff.files_changed_count ?? 0)} files (+${String(diff.total_insertions ?? 0)} / -${String(diff.total_deletions ?? 0)})`,
   ];
 

@@ -42,7 +42,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     STATE_EXECUTING: {STATE_VERIFYING, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
     STATE_VERIFYING: {STATE_REVIEWING, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
     STATE_REVIEWING: {STATE_COMPLETED, STATE_REVISING, STATE_BLOCKED, STATE_FAILED},
-    STATE_REVISING: {STATE_EXECUTING, STATE_BLOCKED, STATE_FAILED},
+    STATE_REVISING: {STATE_EXECUTING, STATE_VERIFYING, STATE_BLOCKED, STATE_FAILED},
     STATE_BLOCKED: {STATE_PLANNED, STATE_REVISING, STATE_EXECUTING, STATE_FAILED},
     STATE_FAILED: {STATE_PLANNED, STATE_REVISING, STATE_EXECUTING, STATE_BLOCKED},
     STATE_COMPLETED: {STATE_REVISING},
@@ -416,6 +416,8 @@ class TaskStore:
                         "current_model": (state.get("model_policy") or {}).get("current_model"),
                         "repair_round": state.get("repair_round", 0),
                         "max_repair_rounds": state.get("max_repair_rounds", 3),
+                        "env_retry_count": state.get("env_retry_count", 0),
+                        "max_env_retries": state.get("max_env_retries", 1),
                         "created_at": meta.get("created_at"),
                         "updated_at": state.get("updated_at"),
                     }

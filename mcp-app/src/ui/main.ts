@@ -263,6 +263,8 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
 
   const repairRound = Number(state.repair_round ?? 0);
   const maxRepairs = Math.max(1, Number(state.max_repair_rounds ?? 3));
+  const envRetryCount = Number(state.env_retry_count ?? 0);
+  const maxEnvRetries = Math.max(0, Number(state.max_env_retries ?? 1));
 
   const verSummary = (state.verification_summary || null) as Record<string, unknown> | null;
   const verFull = (snapshot.verification || null) as Record<string, unknown> | null;
@@ -534,7 +536,7 @@ function renderSnapshot(snapshot: MonitorSnapshot): void {
       </div>
       <div class="pipeline">${stageHtml}</div>
       <div class="repair-row">
-        <span class="repair-label">REPAIR ROUNDS · ${repairRound} / ${maxRepairs}</span>
+        <span class="repair-label">REPAIR ROUNDS · ${repairRound} / ${maxRepairs}${envRetryCount > 0 ? ` · ENV RETRY ${envRetryCount} / ${maxEnvRetries}` : ""}</span>
         <div class="repair-pips" aria-label="Repair rounds ${repairRound} of ${maxRepairs}">${pipsHtml}</div>
       </div>
     </section>

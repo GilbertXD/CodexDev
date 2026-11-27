@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -14,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import get_codex_home
+from .config import ENFORCED_SANDBOX_MODE, get_codex_home, validate_sandbox_mode
 from .state import TaskStore, atomic_write_json, atomic_write_text
 
 
@@ -163,6 +164,189 @@ class CodexRunOutcome:
     estimated_token_usage: dict[str, Any] | None = None
 
 
+ENV_ERROR_TYPES = frozenset({"permission_denied", "missing_dependency", "environment_error"})
+
+_PERMISSION_SIG_RE = re.compile(
+    r"(?:"
+    r"\boperation not permitted\b"
+    r"|\bEPERM\b"
+    r"|\bEACCES\b"
+    r"|\bread-only file system\b"
+    r"|\bEROFS\b"
+    r"|\bsandbox-exec\b"
+    r"|\blandlock\b"
+    r"|\brejected by execution policy\b"
+    r"|\bpermission denied\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_DEPENDENCY_SIG_RE = re.compile(
+    r"(?:"
+    r"\bmissing go\.sum entry\b"
+    r"|\bcannot load module\b"
+    r"|\bno required module provides package\b"
+    r"|\bModuleNotFoundError:\s*No module named\b"
+    r"|\bCannot find module\s+['\"][^./]"
+    r"|\bERR_MODULE_NOT_FOUND\b"
+    r"|\bdial tcp(?:\s+\S+)?:\s*lookup\b"
+    r"|\bproxyconnect tcp\b"
+    r"|\btemporary failure in name resolution\b"
+    r"|\bENOTFOUND\b"
+    r"|\bEAI_AGAIN\b"
+    r"|\bnetwork is unreachable\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_ENV_TOOL_SIG_RE = re.compile(
+    r"(?:"
+    r"\bcommand not found\b"
+    r"|\bexecutable file not found in \$PATH\b"
+    r"|\bCodex binary not found\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _match_env_signature_kind(text: str) -> str | None:
+    if not text or not text.strip():
+        return None
+    if _PERMISSION_SIG_RE.search(text):
+        return "permission_denied"
+    if _DEPENDENCY_SIG_RE.search(text):
+        return "missing_dependency"
+    if _ENV_TOOL_SIG_RE.search(text):
+        return "environment_error"
+    return None
+
+
+def classify_environment_exception(outcome: CodexRunOutcome) -> dict[str, Any] | None:
+    """Classify whether a Builder run failed due to sandbox permission, dependency, or environment issues.
+
+    Strictly separates environment/sandbox/dependency blockers from normal code/test/compile failures.
+    """
+    if outcome.cancelled or outcome.timed_out:
+        return None
+
+    sr = outcome.structured_result if isinstance(outcome.structured_result, dict) else None
+    status = str((sr or {}).get("status") or "").strip().lower()
+    err_type = str((sr or {}).get("error_type") or "none").strip().lower()
+    err_detail = str((sr or {}).get("error_detail") or "").strip()
+    summary = str((sr or {}).get("summary") or "").strip()
+    failed_cmds = [
+        {
+            "command": str(c.get("command") or ""),
+            "exit_code": int(c.get("exit_code", 0) or 0),
+            "summary": str(c.get("summary") or ""),
+        }
+        for c in ((sr or {}).get("commands_run") or [])
+        if isinstance(c, dict) and int(c.get("exit_code", 0) or 0) != 0
+    ]
+
+    # 1) Explicit structured environment error reported by Builder
+    if err_type in ENV_ERROR_TYPES and (not outcome.ok or status in {"blocked", "failed", "partial"}):
+        detail = err_detail or summary or outcome.error_message or f"Builder reported {err_type}."
+        return {
+            "kind": err_type,
+            "detail": detail[:800],
+            "source": "structured_result",
+            "failed_commands": failed_cmds[:10],
+        }
+
+    if status == "blocked" and err_type != "code_error":
+        combined_blocked = "\n".join(
+            part
+            for part in (
+                err_detail,
+                summary,
+                *(c["summary"] for c in failed_cmds),
+                outcome.stderr_tail,
+            )
+            if part
+        )
+        inferred = _match_env_signature_kind(combined_blocked) or "environment_error"
+        detail = err_detail or summary or outcome.error_message or "Builder blocked by environment constraint."
+        return {
+            "kind": inferred,
+            "detail": detail[:800],
+            "source": "structured_blocked",
+            "failed_commands": failed_cmds[:10],
+        }
+
+    # 2) Respect explicit code_error or clean completion
+    if sr is not None and err_type == "code_error" and status != "blocked":
+        return None
+    if outcome.ok and status in {"completed", "ready_for_verify"}:
+        return None
+
+    # 3) High-confidence deterministic CLI / command environment signatures on failed runs
+    if not outcome.ok:
+        if any(c["exit_code"] == 127 for c in failed_cmds):
+            cmd_127 = next(c for c in failed_cmds if c["exit_code"] == 127)
+            detail = err_detail or cmd_127["summary"] or f"Command not found (exit=127): {cmd_127['command']}"
+            return {
+                "kind": "environment_error",
+                "detail": detail[:800],
+                "source": "command_exit_127",
+                "failed_commands": failed_cmds[:10],
+            }
+
+        combined = "\n".join(
+            part
+            for part in (
+                err_detail,
+                outcome.error_message or "",
+                outcome.stderr_tail or "",
+                summary,
+                *(f"{c['command']}: {c['summary']}" for c in failed_cmds),
+            )
+            if part
+        )
+        sig_kind = _match_env_signature_kind(combined)
+        if sig_kind is not None:
+            detail = err_detail or summary or outcome.error_message or outcome.stderr_tail or f"Detected {sig_kind}."
+            return {
+                "kind": sig_kind,
+                "detail": detail.strip()[:800],
+                "source": "signature_match",
+                "failed_commands": failed_cmds[:10],
+            }
+
+    return None
+
+
+def resolve_builder_writable_dirs(
+    task_dir: Path,
+    worktree_path: Path,
+    builder_add_dirs: list[str] | None = None,
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """Provision task-scoped writable cache/temp directories and return (default_env, add_dirs, writable_dirs)."""
+    gocache_dir = (task_dir / "gocache").resolve()
+    gotmp_dir = (task_dir / "gotmp").resolve()
+    tmp_dir = (task_dir / "tmp").resolve()
+    gocache_dir.mkdir(parents=True, exist_ok=True)
+    gotmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    default_env = {
+        "GOCACHE": str(gocache_dir),
+        "GOTMPDIR": str(gotmp_dir),
+        "TMPDIR": str(tmp_dir),
+    }
+    add_dirs: list[str] = [str(gocache_dir), str(gotmp_dir), str(tmp_dir)]
+    if builder_add_dirs:
+        for d in builder_add_dirs:
+            if isinstance(d, str) and d.strip():
+                resolved_d = str(Path(d).expanduser().resolve())
+                if resolved_d not in add_dirs:
+                    add_dirs.append(resolved_d)
+
+    resolved_wt = str(worktree_path.resolve())
+    writable_dirs = [resolved_wt, *(d for d in add_dirs if d != resolved_wt)]
+    return default_env, add_dirs, writable_dirs
+
+
 def build_codex_prompt(
     *,
     task_name: str,
@@ -170,62 +354,34 @@ def build_codex_prompt(
     feedback_text: str | None,
     repair_round: int,
     worktree_path: Path,
+    writable_dirs: list[str] | None = None,
     builder_checks: list[str] | None = None,
     builder_network_access: bool = False,
-    deferred_sandbox_tests: list[str] | None = None,
-    planned_dependency_manifests: list[str] | None = None,
+    env_retry_feedback: str | None = None,
 ) -> str:
-    """Build deterministic builder instructions for Codex CLI."""
-    if builder_network_access:
-        sandbox_rule = (
-            "7. You are running inside a `workspace-write` sandbox with a pre-configured writable "
-            "`GOCACHE`/`GOTMPDIR` outside the worktree and `sandbox_workspace_write.network_access=true` "
-            "(so local loopback servers like 127.0.0.1 and local backing services are reachable, while "
-            "filesystem writes remain confined to the worktree). Prefer running offline/unit package tests "
-            "first and avoid probing `docker info` if Docker is unavailable. The Orchestrator will still "
-            "run full independent host verification after you finish. Once all required edits and "
-            "sandbox-safe checks pass, return `status: \"ready_for_verify\"` or `status: \"completed\"`."
-        )
-    else:
-        sandbox_rule = (
-            "7. You are running inside an OFFLINE `workspace-write` sandbox with a pre-configured writable "
-            "`GOCACHE`/`GOTMPDIR` outside the worktree (so local Go vet/build/test can run without "
-            "polluting the repo, while the shared module cache is read-only and outbound network / "
-            "loopback socket binds are denied with EPERM). Prefer running offline/unit package tests that "
-            "do not require outbound network access, loopback port binding (e.g. 127.0.0.1 via "
-            "`httptest.NewServer`, `net.Listen`, `miniredis.RunT`), a live database, or the Docker daemon (do NOT probe "
-            "`docker info` or retry blocked integration/loopback tests). If this task adds new third-party "
-            "dependencies not yet in the local read-only module cache, do NOT attempt network downloads "
-            "(`go mod download`, `npm install`, `pip install`) or hand-edit checksum lockfiles (`go.sum`); "
-            "edit the manifest (`go.mod`, etc.), verify packages that do not depend on the uncached modules "
-            "(e.g. `GOPROXY=off go vet/test` on unaffected packages), and hand off cleanly. The "
-            "`Verification Commands` section in PLAN.md will be executed as independent verification on "
-            "the host by the Orchestrator (including non-sandbox dependency preparation such as `go mod tidy`) after "
-            "you finish. When your implementation is complete and sandbox-safe checks pass, return "
-            "`status: \"ready_for_verify\"` (do NOT mark `status: \"partial\"` merely because host-only "
-            "verification commands or uncached-module packages could not run inside the offline sandbox)."
-        )
+    """Build concise, language-agnostic Builder instructions for Codex CLI."""
+    eff_writable = writable_dirs or [str(worktree_path)]
+    writable_desc = ", ".join(f"`{d}`" for d in eff_writable)
+    network_desc = "enabled" if builder_network_access else "disabled (offline)"
 
     parts = [
         f"You are the Builder agent executing task '{task_name}' inside an isolated Git worktree.",
-        f"Working directory: {worktree_path}",
         "",
-        "STRICT RULES:",
-        "1. Implement the task strictly according to the immutable PLAN below.",
-        "2. Do NOT weaken, delete, or skip tests, linters, or type checks to make checks pass.",
-        "3. Do NOT run git commit, git push, git merge, or destructive git clean commands.",
-        "4. Complete the FULL implementation across all Target Files in this turn before finishing. "
-        "Do NOT stop early, do NOT exit with zero file edits, and do NOT return `status: \"partial\"` "
-        "merely because the plan spans multiple layers or files — the Orchestrator's post-execution "
-        "invariant guard automatically rejects `partial` and zero-diff exits. Only return "
-        "`status: \"blocked\"` if a concrete external prerequisite makes implementation genuinely "
-        "impossible, and state that exact blocker.",
-        "5. Run relevant sandbox-safe checks before finishing, and report accurate results. "
-        "Avoid shell `rm -f` / `rm -rf` commands (including inside `trap` cleanup hooks or inline smoke tests) "
-        "because Codex CLI's execution policy rejects `rm -f`-style commands; use `python3` with "
-        "`tempfile.TemporaryDirectory()` or `$GOTMPDIR` for temporary scratch fixtures instead.",
+        "=== SANDBOX & PERMISSIONS ===",
+        f"- Sandbox mode: `{ENFORCED_SANDBOX_MODE}` (immutable; permission expansion is prohibited).",
+        f"- Working directory: `{worktree_path}`",
+        f"- Writable directories: {writable_desc}",
+        f"- Network access: {network_desc}",
+        "- Environment & dependencies: Prepared upstream by the upper layer.",
+        "=== END SANDBOX & PERMISSIONS ===",
+        "",
+        "CORE CONSTRAINTS:",
+        "1. Complete the FULL implementation strictly according to the immutable PLAN across all declared Target Files; do NOT expand task scope or exit with partial/zero edits when unblocked.",
+        "2. Environment and dependencies are prepared upstream. Do NOT request expanded permissions, attempt to bypass sandbox boundaries, or loop on blocked workarounds.",
+        "3. If you encounter a permission denial or missing dependency/tool that blocks required edits or specified Builder Checks, stop retrying the blocked operation and report it truthfully (`status: \"blocked\"`, `error_type: \"permission_denied\" | \"missing_dependency\" | \"environment_error\"`, with the exact command and error in `error_detail`).",
+        "4. Execute the specified Builder Checks (if any); full acceptance verification is handled independently on the host by the Verifier. Return `status: \"ready_for_verify\"` or `status: \"completed\"` with `error_type: \"none\"` when finished.",
+        "5. Do NOT weaken, delete, or skip tests, linters, or type checks, and do NOT run `git commit`, `git push`, `git merge`, or destructive git clean commands.",
         "6. Return your final response strictly conforming to the provided JSON output schema.",
-        sandbox_rule,
         "",
         "=== IMMUTABLE PLAN CONTRACT ===",
         plan_text.strip(),
@@ -235,30 +391,18 @@ def build_codex_prompt(
         parts.extend(
             [
                 "",
-                "=== SANDBOX-SAFE BUILDER CHECKS (RUN THESE INSIDE THE SANDBOX) ===",
+                "=== BUILDER CHECKS ===",
                 *(f"- `{cmd}`" for cmd in builder_checks),
+                "=== END BUILDER CHECKS ===",
             ]
         )
-        if deferred_sandbox_tests:
-            parts.append(
-                "Note: Socket/loopback-binding test(s) automatically deferred to host verification: "
-                + ", ".join(f"`{t}`" for t in deferred_sandbox_tests[:25])
-                + (f" (+{len(deferred_sandbox_tests) - 25} more)" if len(deferred_sandbox_tests) > 25 else "")
-                + ". Do NOT retry them inside the offline sandbox."
-            )
-        parts.append("=== END BUILDER CHECKS ===")
-    if not builder_network_access and planned_dependency_manifests:
+    if env_retry_feedback and env_retry_feedback.strip():
         parts.extend(
             [
                 "",
-                "=== OFFLINE SANDBOX DEPENDENCY NOTICE ===",
-                "Target Files include dependency manifest(s): "
-                + ", ".join(f"`{m}`" for m in planned_dependency_manifests[:10])
-                + ". Any newly added third-party dependencies will be downloaded and tidied on the host "
-                "by the Orchestrator's automatic dependency preparation step (e.g. `go mod tidy`) before host verification. "
-                "Do NOT attempt network downloads or manually synthesize checksum lockfiles (`go.sum`) inside the offline sandbox; "
-                "run offline checks on packages without uncached imports and return `status: \"ready_for_verify\"`.",
-                "=== END DEPENDENCY NOTICE ===",
+                "=== ENVIRONMENT RETRY CONTEXT (MAX 1 RETRY — PERMISSIONS UNCHANGED) ===",
+                env_retry_feedback.strip(),
+                "=== END ENVIRONMENT RETRY CONTEXT ===",
             ]
         )
     if repair_round > 0 and feedback_text and feedback_text.strip():
@@ -508,6 +652,7 @@ def run_codex_exec(
     on_token_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> CodexRunOutcome:
     """Execute `codex exec` non-interactively, streaming JSONL events into the task store."""
+    enforced_sandbox = validate_sandbox_mode(sandbox_mode)
     tdir = store.task_dir(task_id)
     run_tag = f"round_{repair_round}_attempt_{attempt}"
     raw_jsonl_path = tdir / f"codex_{run_tag}.jsonl"
@@ -519,29 +664,16 @@ def run_codex_exec(
         except OSError:
             pass
 
-    # Provision writable Go build/temp cache directories outside the worktree so Go vet/test/build
-    # works cleanly inside Codex's workspace-write sandbox without polluting git status.
-    gocache_dir = (tdir / "gocache").resolve()
-    gotmp_dir = (tdir / "gotmp").resolve()
-    gocache_dir.mkdir(parents=True, exist_ok=True)
-    gotmp_dir.mkdir(parents=True, exist_ok=True)
-
-    injected_env: dict[str, str] = {
-        "GOCACHE": str(gocache_dir),
-        "GOTMPDIR": str(gotmp_dir),
-    }
+    default_env, add_dirs, writable_dirs = resolve_builder_writable_dirs(
+        tdir,
+        worktree_path,
+        builder_add_dirs,
+    )
+    injected_env: dict[str, str] = dict(default_env)
     if builder_env:
         for k, v in builder_env.items():
             if isinstance(k, str) and k.strip() and v is not None:
                 injected_env[k.strip()] = str(v)
-
-    add_dirs: list[str] = [str(gocache_dir), str(gotmp_dir)]
-    if builder_add_dirs:
-        for d in builder_add_dirs:
-            if isinstance(d, str) and d.strip():
-                resolved_d = str(Path(d).expanduser().resolve())
-                if resolved_d not in add_dirs:
-                    add_dirs.append(resolved_d)
 
     eff_isolation = builder_isolation if builder_isolation in VALID_BUILDER_ISOLATION else "strict"
     isolated_codex_home: Path | None = None
@@ -559,7 +691,7 @@ def run_codex_exec(
         "-m",
         model,
         "-s",
-        sandbox_mode,
+        enforced_sandbox,
         "-C",
         str(worktree_path),
         "--json",
@@ -579,7 +711,7 @@ def run_codex_exec(
         cmd.extend(["-c", "notify=[]"])
     else:
         cmd.extend(["--disable", "api_key_model_discovery"])
-    if sandbox_mode == "workspace-write" and builder_network_access:
+    if builder_network_access:
         cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
     for extra_dir in add_dirs:
         cmd.extend(["--add-dir", extra_dir])
@@ -592,6 +724,13 @@ def run_codex_exec(
     proc_env = {**os.environ, **injected_env}
     if isolated_codex_home is not None:
         proc_env["CODEX_HOME"] = str(isolated_codex_home)
+
+    sandbox_boundary = {
+        "sandbox_mode": enforced_sandbox,
+        "network_access": bool(builder_network_access),
+        "writable_dirs": writable_dirs,
+        "builder_isolation": eff_isolation,
+    }
 
     start_ts = time.monotonic()
     last_activity_ts = start_ts
@@ -612,16 +751,17 @@ def run_codex_exec(
         agent="Codex CLI (Builder)",
         event_type="codex_invoked",
         message=(
-            f"Starting Codex CLI (model={model}, sandbox={sandbox_mode}, "
+            f"Starting Codex CLI (model={model}, sandbox={enforced_sandbox}, "
             f"round={repair_round}, attempt={attempt}, timeout={timeout_sec}s"
             + (f", idle_timeout={idle_timeout_sec}s" if idle_timeout_sec > 0 else "")
             + ")"
         ),
         details={
             "model": model,
-            "sandbox": sandbox_mode,
+            "sandbox": enforced_sandbox,
+            "sandbox_boundary": sandbox_boundary,
             "builder_isolation": eff_isolation,
-            "builder_network_access": bool(sandbox_mode == "workspace-write" and builder_network_access),
+            "builder_network_access": bool(builder_network_access),
             "isolated_codex_home": str(isolated_codex_home) if isolated_codex_home else None,
             "round": repair_round,
             "attempt": attempt,
@@ -899,6 +1039,7 @@ def run_codex_exec(
         "round": repair_round,
         "attempt": attempt,
         "model": model,
+        "sandbox_boundary": sandbox_boundary,
         "exit_code": effective_exit_code,
         "timed_out": timed_out,
         "timeout_reason": timeout_reason,
@@ -994,15 +1135,27 @@ def run_codex_exec(
             estimated_token_usage=estimated_usage,
         )
 
-    if structured_result and structured_result.get("status") in ("failed", "blocked"):
-        st_val = str(structured_result.get("status"))
+    if structured_result and (
+        structured_result.get("status") in ("failed", "blocked")
+        or str(structured_result.get("error_type") or "").strip().lower() in ENV_ERROR_TYPES
+    ):
+        st_val = str(structured_result.get("status") or "blocked")
+        err_type_val = str(structured_result.get("error_type") or "none").strip().lower()
+        err_detail_val = str(structured_result.get("error_detail") or "").strip()
+        summary_val = str(structured_result.get("summary") or "").strip()
+        err_msg = err_detail_val or summary_val or f"Codex reported status={st_val}"
+        fail_cat = (
+            "environment_failure"
+            if err_type_val in ENV_ERROR_TYPES
+            else ("builder_blocked" if st_val == "blocked" else "execution_failure")
+        )
         return CodexRunOutcome(
             ok=False,
             exit_code=exit_code,
             timed_out=False,
             cancelled=False,
-            failure_category="builder_blocked" if st_val == "blocked" else "execution_failure",
-            error_message=str(structured_result.get("summary") or f"Codex reported status={st_val}"),
+            failure_category=fail_cat,
+            error_message=err_msg,
             duration_sec=duration,
             structured_result=structured_result,
             token_usage=latest_usage,
