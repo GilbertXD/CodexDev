@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import shlex
 import signal
+import socket
+import ssl
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import ENFORCED_SANDBOX_MODE, get_codex_home, validate_sandbox_mode
-from .state import TaskStore, atomic_write_json, atomic_write_text
+from .state import TaskStore, atomic_write_json, atomic_write_text, utc_now
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "codex_result.schema.json"
@@ -588,6 +594,240 @@ BENIGN_STDERR_MARKERS = (
     "codex_models_manager::manager: failed to refresh available models",
 )
 
+DEFAULT_PREFLIGHT_URL = "https://chatgpt.com"
+
+UPSTREAM_TRANSPORT_ERROR_PATTERNS = (
+    re.compile(r"workspace routing discovery failed", re.IGNORECASE),
+    re.compile(r"Falling back from WebSockets to HTTPS transport", re.IGNORECASE),
+    re.compile(r"Reconnecting\.\.\.\s*\d+\s*/\s*\d+", re.IGNORECASE),
+    re.compile(r"SSL_ERROR_SYSCALL", re.IGNORECASE),
+    re.compile(r"unexpected EOF while reading", re.IGNORECASE),
+    re.compile(r"connection reset by peer", re.IGNORECASE),
+    re.compile(r"failed to connect to", re.IGNORECASE),
+    re.compile(r"error sending request for url", re.IGNORECASE),
+    re.compile(r"dns error", re.IGNORECASE),
+    re.compile(r"network is unreachable", re.IGNORECASE),
+    re.compile(r"timed out while connecting", re.IGNORECASE),
+)
+
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def is_upstream_transport_error(text: str | None) -> bool:
+    """Return True if an error line matches known Codex CLI upstream transport/connectivity failures."""
+    if not text:
+        return False
+    return any(pat.search(text) for pat in UPSTREAM_TRANSPORT_ERROR_PATTERNS)
+
+
+def resolve_preflight_target_url(
+    builder_cfg: dict[str, Any] | None = None,
+    builder_env: dict[str, str] | None = None,
+) -> str:
+    """Resolve the upstream Codex endpoint URL to probe before launching Builder."""
+    if isinstance(builder_cfg, dict):
+        explicit = str(builder_cfg.get("preflight_url") or "").strip()
+        if explicit:
+            return explicit
+    if isinstance(builder_env, dict):
+        from_benv = str(builder_env.get("OPENAI_BASE_URL") or "").strip()
+        if from_benv:
+            return from_benv
+    from_env = str(os.environ.get("OPENAI_BASE_URL") or "").strip()
+    if from_env:
+        return from_env
+    return DEFAULT_PREFLIGHT_URL
+
+
+def _host_bypassed_by_no_proxy(host: str, no_proxy: str) -> bool:
+    host_l = host.lower().strip(".")
+    if not no_proxy:
+        return False
+    for raw in no_proxy.split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        # Strip optional :port suffix
+        if ":" in entry and not entry.startswith("["):
+            entry = entry.split(":", 1)[0]
+        entry = entry.lstrip(".")
+        if host_l == entry or host_l.endswith("." + entry):
+            return True
+    return False
+
+
+def _select_proxy_for_url(scheme: str, host: str, env: dict[str, str]) -> str | None:
+    if host.lower() in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    no_proxy = env.get("NO_PROXY") or env.get("no_proxy") or ""
+    if _host_bypassed_by_no_proxy(host, no_proxy):
+        return None
+    keys = (
+        ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        if scheme == "https"
+        else ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+    )
+    for key in keys:
+        val = str(env.get(key) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def _has_fake_ip(resolved_ips: list[str]) -> bool:
+    for ip_str in resolved_ips:
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            if isinstance(addr, ipaddress.IPv4Address) and addr in _FAKE_IP_NET:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def check_upstream_connectivity(
+    target_url: str,
+    *,
+    timeout_sec: float = 5.0,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Perform a fast, host-side TCP/TLS (or proxy HTTP) reachability probe before starting Builder.
+
+    Runs strictly on the host side so Builder's immutable `workspace-write` sandbox (`network_access: false`)
+    is never weakened.
+    """
+    start_ts = time.monotonic()
+    eff_timeout = max(0.5, float(timeout_sec or 5.0))
+    eff_env = dict(os.environ) if env is None else dict(env)
+
+    parsed = urllib.parse.urlparse(target_url)
+    scheme = (parsed.scheme or "").lower()
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    if scheme not in {"http", "https"} or not host:
+        return {
+            "ok": False,
+            "checked_at": utc_now(),
+            "target_url": target_url,
+            "host": host,
+            "port": port,
+            "scheme": scheme,
+            "resolved_ips": [],
+            "proxy_used": None,
+            "timeout_sec": eff_timeout,
+            "duration_sec": round(time.monotonic() - start_ts, 2),
+            "error": f"Invalid preflight URL: {target_url!r} (expected http:// or https:// with hostname)",
+            "hint": "Check builder.preflight_url or OPENAI_BASE_URL configuration.",
+        }
+
+    proxy_url = _select_proxy_for_url(scheme, host, eff_env)
+    resolved_ips: list[str] = []
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        seen: set[str] = set()
+        for info in infos:
+            ip = str(info[4][0])
+            if ip not in seen:
+                seen.add(ip)
+                resolved_ips.append(ip)
+    except OSError as exc:
+        if not proxy_url:
+            return {
+                "ok": False,
+                "checked_at": utc_now(),
+                "target_url": target_url,
+                "host": host,
+                "port": port,
+                "scheme": scheme,
+                "resolved_ips": [],
+                "proxy_used": None,
+                "timeout_sec": eff_timeout,
+                "duration_sec": round(time.monotonic() - start_ts, 2),
+                "error": f"DNS resolution failed for {host}: {exc}",
+                "hint": "Check network connectivity, DNS, VPN/TUN proxy settings, or OPENAI_BASE_URL before resuming.",
+            }
+
+    err_msg: str | None = None
+    if proxy_url and proxy_url.lower().startswith(("http://", "https://")):
+        # Test end-to-end reachability through explicit HTTP/HTTPS proxy; any HTTP status proves transport works.
+        proxies = {"http": proxy_url, "https": proxy_url}
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+        req = urllib.request.Request(target_url, method="HEAD", headers={"User-Agent": "codex-dev-preflight/1"})
+        try:
+            with opener.open(req, timeout=eff_timeout):
+                pass
+        except urllib.error.HTTPError:
+            # HTTP 401/403/404/405 still confirms TLS + HTTP reachability to the upstream endpoint.
+            pass
+        except Exception as exc:
+            err_msg = f"Proxy connectivity check via {proxy_url} failed: {exc}"
+    else:
+        # Direct or TUN-mode probe: TCP connect + TLS handshake (for https) to catch Fake-IP/TLS drops fast.
+        raw_sock: socket.socket | None = None
+        tls_sock: ssl.SSLSocket | None = None
+        try:
+            raw_sock = socket.create_connection((host, port), timeout=eff_timeout)
+            raw_sock.settimeout(eff_timeout)
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                tls_sock.settimeout(eff_timeout)
+                tls_sock.do_handshake()
+        except Exception as exc:
+            err_msg = f"{'TLS' if scheme == 'https' else 'TCP'} connection to {host}:{port} failed: {exc}"
+        finally:
+            for s in (tls_sock, raw_sock):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+    duration = round(time.monotonic() - start_ts, 2)
+    if err_msg is None:
+        return {
+            "ok": True,
+            "checked_at": utc_now(),
+            "target_url": target_url,
+            "host": host,
+            "port": port,
+            "scheme": scheme,
+            "resolved_ips": resolved_ips[:4],
+            "proxy_used": proxy_url,
+            "timeout_sec": eff_timeout,
+            "duration_sec": duration,
+            "error": None,
+            "hint": None,
+        }
+
+    if _has_fake_ip(resolved_ips):
+        hint = (
+            f"Resolved IP ({', '.join(resolved_ips[:2])}) is in the local TUN/Fake-IP range (198.18.0.0/15); "
+            "switch proxy node/route or disable broken TUN proxy, then resume `codex-dev run-round`."
+        )
+    elif proxy_url:
+        hint = f"Check proxy server ({proxy_url}) health or switch proxy route, then resume `codex-dev run-round`."
+    else:
+        hint = "Check network connectivity, VPN/proxy settings, or OPENAI_BASE_URL, then resume `codex-dev run-round`."
+
+    return {
+        "ok": False,
+        "checked_at": utc_now(),
+        "target_url": target_url,
+        "host": host,
+        "port": port,
+        "scheme": scheme,
+        "resolved_ips": resolved_ips[:4],
+        "proxy_used": proxy_url,
+        "timeout_sec": eff_timeout,
+        "duration_sec": duration,
+        "error": err_msg[:500],
+        "hint": hint,
+    }
+
 
 def _is_benign_stderr_line(line: str) -> bool:
     return any(marker in line for marker in BENIGN_STDERR_MARKERS)
@@ -649,6 +889,7 @@ def run_codex_exec(
     builder_add_dirs: list[str] | None = None,
     builder_isolation: str = "strict",
     builder_network_access: bool = False,
+    max_consecutive_transport_errors: int = 5,
     on_token_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> CodexRunOutcome:
     """Execute `codex exec` non-interactively, streaming JSONL events into the task store."""
@@ -840,6 +1081,11 @@ def run_codex_exec(
     streamed_chars = 0
     latest_usage: dict[str, Any] | None = None
     last_error_msg: str | None = None
+    has_model_progress = False
+    consecutive_transport_errors = 0
+    transport_fail_fast = False
+    transport_fail_msg: str | None = None
+    eff_max_transport_errors = max(0, int(max_consecutive_transport_errors))
     active_extensions_used = 0
     effective_timeout_sec = max(1, int(timeout_sec))
     eff_grace_sec = max(0, int(active_grace_sec))
@@ -943,6 +1189,8 @@ def run_codex_exec(
 
                     usage = _extract_usage(ev)
                     if usage:
+                        has_model_progress = True
+                        consecutive_transport_errors = 0
                         latest_usage, delta_usage = _accumulate_attempt_usage(latest_usage, usage)
                         if on_token_usage and any(
                             delta_usage.get(k, 0) > 0 for k in ("input_tokens", "output_tokens", "total_tokens")
@@ -950,7 +1198,19 @@ def run_codex_exec(
                             on_token_usage(delta_usage)
 
                     if ev.get("type") == "turn.completed":
+                        has_model_progress = True
+                        consecutive_transport_errors = 0
                         _mark_turn_completed()
+
+                    ev_item = ev.get("item")
+                    if isinstance(ev_item, dict) and str(ev_item.get("type") or "") in {
+                        "agent_message",
+                        "file_change",
+                        "command_execution",
+                        "reasoning",
+                    }:
+                        has_model_progress = True
+                        consecutive_transport_errors = 0
 
                     summary = _summarize_jsonl_event(ev)
                     if summary:
@@ -965,6 +1225,31 @@ def run_codex_exec(
                             message=ev_msg,
                             details={"round": repair_round, "attempt": attempt, "model": model},
                         )
+                        if ev_type == "codex_error" and not has_model_progress and is_upstream_transport_error(ev_msg):
+                            consecutive_transport_errors += 1
+                            transport_fail_msg = ev_msg
+                            if eff_max_transport_errors > 0 and consecutive_transport_errors >= eff_max_transport_errors:
+                                transport_fail_fast = True
+                                store.append_event(
+                                    task_id,
+                                    phase="execute",
+                                    agent="Orchestrator (Watchdog)",
+                                    event_type="codex_transport_fail_fast",
+                                    message=(
+                                        f"Aborting Codex CLI early after {consecutive_transport_errors} consecutive "
+                                        f"upstream transport errors with no model progress: {ev_msg[:200]}"
+                                    ),
+                                    details={
+                                        "round": repair_round,
+                                        "attempt": attempt,
+                                        "consecutive_transport_errors": consecutive_transport_errors,
+                                        "threshold": eff_max_transport_errors,
+                                    },
+                                )
+                                _terminate_process_group(proc)
+                                break
+                        elif ev_type == "codex_error":
+                            consecutive_transport_errors = 0
 
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -1113,14 +1398,44 @@ def run_codex_exec(
             estimated_token_usage=estimated_usage,
         )
 
-    if effective_exit_code != 0:
-        err = last_error_msg or stderr_tail or f"Codex CLI exited abnormally with code {effective_exit_code}"
+    if transport_fail_fast:
+        err = (
+            f"Codex CLI aborted early after {consecutive_transport_errors} consecutive upstream transport "
+            f"error(s) with no model progress: {transport_fail_msg or last_error_msg or 'upstream connection failed'}"
+        )
         return CodexRunOutcome(
             ok=False,
             exit_code=effective_exit_code,
             timed_out=False,
             cancelled=False,
-            failure_category="execution_failure",
+            failure_category="upstream_connectivity_failure",
+            error_message=err[:1000],
+            duration_sec=duration,
+            structured_result=structured_result,
+            token_usage=latest_usage,
+            events_seen=events_seen,
+            raw_jsonl_path=str(raw_jsonl_path),
+            result_file_path=str(result_file_path),
+            stderr_tail=stderr_tail,
+            attempt=attempt,
+            active_extensions_used=active_extensions_used,
+            effective_timeout_sec=effective_timeout_sec,
+            estimated_token_usage=estimated_usage,
+        )
+
+    if effective_exit_code != 0:
+        err = last_error_msg or stderr_tail or f"Codex CLI exited abnormally with code {effective_exit_code}"
+        fail_cat = (
+            "upstream_connectivity_failure"
+            if (not has_model_progress and (is_upstream_transport_error(last_error_msg) or is_upstream_transport_error(stderr_tail)))
+            else "execution_failure"
+        )
+        return CodexRunOutcome(
+            ok=False,
+            exit_code=effective_exit_code,
+            timed_out=False,
+            cancelled=False,
+            failure_category=fail_cat,
             error_message=err[:1000],
             duration_sec=duration,
             structured_result=structured_result,

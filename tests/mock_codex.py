@@ -116,6 +116,22 @@ def main() -> int:
         sys.stderr.write("sandbox-exec: bind 127.0.0.1: Operation not permitted (EPERM)\n")
         return 1
 
+    if scenario == "upstream_routing_loop":
+        # Simulate Codex CLI's repeated upstream WebSocket/HTTPS reconnect failure loop before any model progress.
+        for i in range(1, 6):
+            emit(
+                {
+                    "type": "error",
+                    "message": (
+                        f"Reconnecting... {i}/5 (workspace routing discovery failed: "
+                        "error sending request for url (https://chatgpt.com/backend-api/codex))"
+                    ),
+                }
+            )
+            time.sleep(0.05)
+        time.sleep(30)
+        return 1
+
     is_repair = "REPAIR ROUND" in prompt
     has_env_retry = "=== ENVIRONMENT RETRY CONTEXT" in prompt
     res_error_type = "none"

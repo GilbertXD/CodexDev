@@ -132,6 +132,9 @@ class TestCodexDevOrchestrator(unittest.TestCase):
             "max_repair_rounds": 3,
             "codex_timeout_sec": 30,
             "verify_timeout_sec": 30,
+            "builder": {
+                "preflight_connectivity": False,
+            },
             "model_policy": {
                 "mode": "auto",
                 "locked": False,
@@ -2036,6 +2039,149 @@ Add standalone documents with migration, API, and integration tests.
         self.assertIn("- Evidence:", exec_log)
         self.assertIn(ev1, exec_log)
         self.assertIn(ev2, exec_log)
+
+    def test_37_upstream_connectivity_preflight_and_transport_fail_fast(self) -> None:
+        import http.server
+        import socket
+        from codex_dev.codex_runner import (
+            _has_fake_ip,
+            is_upstream_transport_error,
+            resolve_preflight_target_url,
+        )
+
+        # Unit check helper precedence and Fake-IP TUN detection
+        self.assertTrue(_has_fake_ip(["198.18.0.55"]))
+        self.assertFalse(_has_fake_ip(["127.0.0.1", "1.1.1.1"]))
+        self.assertTrue(is_upstream_transport_error("Reconnecting... 2/5 (workspace routing discovery failed)"))
+        self.assertFalse(is_upstream_transport_error("AssertionError: expected 12 got 7"))
+        self.assertEqual(
+            resolve_preflight_target_url({"preflight_url": "https://custom.example"}, {"OPENAI_BASE_URL": "https://env.example"}),
+            "https://custom.example",
+        )
+        self.assertEqual(
+            resolve_preflight_target_url({}, {"OPENAI_BASE_URL": "https://env.example/v1"}),
+            "https://env.example/v1",
+        )
+
+        # Find an unused local TCP port (connection refused -> instant fail-fast)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            closed_port = s.getsockname()[1]
+
+        repo = _create_python_repo(self.tmp_path / "preflight_repo")
+        cfg_path = self.home_dir / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["builder"] = {
+            "network_access": False,
+            "allow_empty_diff": False,
+            "preflight_connectivity": True,
+            "preflight_timeout_sec": 2,
+            "preflight_url": f"http://127.0.0.1:{closed_port}",
+            "max_consecutive_transport_errors": 3,
+        }
+        atomic_write_json(cfg_path, cfg)
+
+        os.environ["MOCK_CODEX_SCENARIO"] = "success"
+        tid = self.orch.init_task(name="Preflight connectivity test", repo_path=repo)["task"]["task_id"]
+        self.orch.save_plan(tid, PLAN_PY)
+
+        # 1. Round 0 preflight fails fast before Builder ever spawns
+        t0 = time.monotonic()
+        res_fail = self.orch.run_round(tid)
+        elapsed_fail = time.monotonic() - t0
+        self.assertLess(elapsed_fail, 3.0)
+        self.assertFalse(res_fail["ok"])
+        self.assertEqual(res_fail["stage"], "preflight")
+        self.assertEqual(res_fail["next_action"], "blocked_connectivity")
+        self.assertIsNone(res_fail["execution"])
+        self.assertEqual(res_fail["state"]["status"], STATE_BLOCKED)
+        self.assertEqual(res_fail["state"]["failure_category"], "upstream_connectivity_failure")
+        self.assertTrue(res_fail["state"]["env_prepared"])
+        self.assertEqual(res_fail["state"]["execution_attempts"], 0)
+        self.assertEqual(res_fail["state"]["repair_round"], 0)
+        self.assertEqual(res_fail["state"]["env_retry_count"], 0)
+
+        status_blocked = self.orch.get_status(tid)
+        self.assertIsNotNone(status_blocked["preflight_report"])
+        self.assertFalse(status_blocked["preflight_report"]["ok"])
+        self.assertEqual(status_blocked["preflight_report"]["port"], closed_port)
+
+        # 2. Bring up a reachable local HTTP server -> resume succeeds without model escalation
+        class _QuietHandler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _QuietHandler)
+        srv_port = server.server_address[1]
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        try:
+            cfg["builder"]["preflight_url"] = f"http://127.0.0.1:{srv_port}"
+            atomic_write_json(cfg_path, cfg)
+
+            res_ok = self.orch.run_round(tid)
+            self.assertTrue(res_ok["ok"])
+            self.assertEqual(res_ok["next_action"], "review_required")
+            self.assertEqual(res_ok["state"]["execution_attempts"], 1)
+            self.assertEqual(res_ok["state"]["repair_round"], 0)
+            self.assertEqual(res_ok["state"]["model_policy"]["current_model"], "gpt-6-luna")
+
+            # 3. Trigger Repair Round 1 while env_prepared is already True, then drop connectivity -> preflight catches it again!
+            rev = self.orch.record_review(
+                tid,
+                verdict="request_changes",
+                summary="Simulate mid-task connectivity drop before repair round 1.",
+                issues=["Re-verify connectivity preflight on repair round"],
+            )
+            self.assertEqual(rev["next_action"], "repair_available")
+            self.assertEqual(rev["state"]["repair_round"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            srv_thread.join(timeout=2)
+
+        res_repair_blocked = self.orch.run_round(tid)
+        self.assertFalse(res_repair_blocked["ok"])
+        self.assertEqual(res_repair_blocked["stage"], "preflight")
+        self.assertEqual(res_repair_blocked["next_action"], "blocked_connectivity")
+        self.assertEqual(res_repair_blocked["state"]["status"], STATE_BLOCKED)
+        self.assertEqual(res_repair_blocked["state"]["failure_category"], "upstream_connectivity_failure")
+        self.assertEqual(res_repair_blocked["state"]["execution_attempts"], 1)
+        self.assertEqual(res_repair_blocked["state"]["repair_round"], 1)
+        self.assertTrue(res_repair_blocked["state"]["env_prepared"])
+
+        # 4. JSONL stream fail-fast guard: preflight passes, but Builder hits repeated upstream reconnect loop
+        server2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _QuietHandler)
+        srv2_port = server2.server_address[1]
+        srv2_thread = threading.Thread(target=server2.serve_forever, daemon=True)
+        srv2_thread.start()
+        try:
+            cfg["builder"]["preflight_url"] = f"http://127.0.0.1:{srv2_port}"
+            atomic_write_json(cfg_path, cfg)
+
+            os.environ["MOCK_CODEX_SCENARIO"] = "upstream_routing_loop"
+            tid2 = self.orch.init_task(name="Stream transport fail-fast test", repo_path=repo)["task"]["task_id"]
+            self.orch.save_plan(tid2, PLAN_PY)
+
+            t1 = time.monotonic()
+            res_stream = self.orch.run_round(tid2)
+            elapsed_stream = time.monotonic() - t1
+            self.assertLess(elapsed_stream, 5.0)
+            self.assertFalse(res_stream["ok"])
+            self.assertEqual(res_stream["stage"], "execute")
+            self.assertEqual(res_stream["next_action"], "blocked_connectivity")
+            self.assertEqual(res_stream["state"]["status"], STATE_BLOCKED)
+            self.assertEqual(res_stream["state"]["failure_category"], "upstream_connectivity_failure")
+            self.assertEqual(res_stream["state"]["repair_round"], 0)
+            self.assertEqual(res_stream["state"]["env_retry_count"], 0)
+        finally:
+            server2.shutdown()
+            server2.server_close()
+            srv2_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

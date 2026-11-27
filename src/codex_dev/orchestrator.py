@@ -12,8 +12,10 @@ from typing import Any
 from .codex_runner import (
     CodexRunOutcome,
     build_codex_prompt,
+    check_upstream_connectivity,
     classify_environment_exception,
     resolve_builder_writable_dirs,
+    resolve_preflight_target_url,
     run_codex_exec,
 )
 from .config import (
@@ -860,10 +862,80 @@ class Orchestrator:
                 "builder_isolation": locked_isolation,
             }
             state["sandbox_boundary"] = public_boundary
+            builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
+            builder_env_cfg = cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None
+
+            # 3b. Per-attempt host-side upstream connectivity preflight (fail fast before spawning Builder)
+            if bool(builder_cfg.get("preflight_connectivity", True)):
+                preflight_url = resolve_preflight_target_url(builder_cfg, builder_env_cfg)
+                preflight_timeout = float(builder_cfg.get("preflight_timeout_sec", 5.0))
+                preflight_env = {**os.environ, **(builder_env_cfg or {})}
+                preflight = check_upstream_connectivity(
+                    preflight_url,
+                    timeout_sec=preflight_timeout,
+                    env=preflight_env,
+                )
+                atomic_write_json(tdir / "PREFLIGHT_REPORT.json", preflight)
+                state["preflight"] = preflight
+                if not preflight["ok"]:
+                    err_msg = (
+                        f"Upstream Codex connectivity preflight failed for {preflight['target_url']} "
+                        f"({preflight['duration_sec']}s): {preflight['error']}"
+                    )
+                    self.store.append_execution_log(
+                        tid,
+                        "Pre-Builder Upstream Connectivity Preflight (FAILED)",
+                        f"- Target: `{preflight['target_url']}` (host=`{preflight['host']}`, port=`{preflight['port']}`)\n"
+                        f"- Resolved IPs: `{preflight['resolved_ips'] or 'none'}` | Proxy: `{preflight['proxy_used'] or 'direct/TUN'}`\n"
+                        f"- Duration: `{preflight['duration_sec']}s` (timeout=`{preflight['timeout_sec']}s`)\n"
+                        f"- Error: {preflight['error']}\n"
+                        + (f"- Hint: {preflight['hint']}\n" if preflight.get("hint") else ""),
+                    )
+                    self.store.transition(
+                        tid,
+                        state,
+                        STATE_BLOCKED,
+                        event_type="preflight_connectivity_blocked",
+                        message=(
+                            f"Builder not started — upstream connectivity preflight failed in "
+                            f"{preflight['duration_sec']}s (repair round & env_prepared preserved): {preflight['error']}"
+                        ),
+                        failure_category="upstream_connectivity_failure",
+                        last_error=err_msg[:800],
+                        details={"stage": "preflight", "preflight": preflight},
+                    )
+                    return {
+                        "ok": False,
+                        "stage": "preflight",
+                        "next_action": "blocked_connectivity",
+                        "task_id": tid,
+                        "preflight": preflight,
+                        "state": state,
+                    }
+                self.store.append_event(
+                    tid,
+                    phase="execute",
+                    agent="Orchestrator (Preflight)",
+                    event_type="preflight_connectivity_passed",
+                    message=(
+                        f"Upstream connectivity preflight passed for {preflight['target_url']} "
+                        f"in {preflight['duration_sec']}s."
+                    ),
+                    details={
+                        "target_url": preflight["target_url"],
+                        "resolved_ips": preflight["resolved_ips"],
+                        "proxy_used": preflight["proxy_used"],
+                        "duration_sec": preflight["duration_sec"],
+                    },
+                )
 
             repair_round = int(state.get("repair_round", 0))
             prev_failure_category = state.get("failure_category")
-            non_escalating_prev = prev_failure_category in {"environment_failure", "dependency_prepare_failure"}
+            non_escalating_prev = prev_failure_category in {
+                "environment_failure",
+                "dependency_prepare_failure",
+                "upstream_connectivity_failure",
+            }
             should_escalate = escalate_model or (
                 repair_round > 0
                 and state["model_policy"].get("mode") == "auto"
@@ -925,7 +997,6 @@ class Orchestrator:
             plan_text = (tdir / "PLAN.md").read_text(encoding="utf-8")
             contract_doc = read_json(tdir / "contract.json") or {}
             builder_checks = list(contract_doc.get("builder_checks") or [])
-            builder_cfg = cfg.get("builder") if isinstance(cfg.get("builder"), dict) else {}
             feedback_path = tdir / "FEEDBACK.md"
             feedback_text = feedback_path.read_text(encoding="utf-8") if feedback_path.is_file() else None
 
@@ -980,10 +1051,11 @@ class Orchestrator:
                     active_grace_sec=int(cfg.get("codex_active_grace_sec", 300)),
                     active_grace_window_sec=int(cfg.get("codex_active_grace_window_sec", 60)),
                     max_active_extensions=int(cfg.get("codex_max_active_extensions", 2)),
-                    builder_env=cfg.get("builder_env") if isinstance(cfg.get("builder_env"), dict) else None,
+                    builder_env=builder_env_cfg,
                     builder_add_dirs=locked_extra_add_dirs or None,
                     builder_isolation=locked_isolation,
                     builder_network_access=locked_network_access,
+                    max_consecutive_transport_errors=int(builder_cfg.get("max_consecutive_transport_errors", 5)),
                     on_token_usage=_live_usage_cb,
                 )
 
@@ -1065,6 +1137,35 @@ class Orchestrator:
                     last_error=outcome.error_message,
                 )
                 return {"ok": False, "task_id": tid, "outcome": outcome.__dict__, "state": state}
+
+            if outcome.failure_category == "upstream_connectivity_failure":
+                err_msg = (outcome.error_message or "Codex CLI upstream connectivity failure.")[:800]
+                self.store.transition(
+                    tid,
+                    state,
+                    STATE_BLOCKED,
+                    event_type="upstream_connectivity_blocked",
+                    message=(
+                        f"Builder aborted due to upstream connectivity failure (repair round & env_retry_count preserved): "
+                        f"{err_msg[:300]}"
+                    ),
+                    failure_category="upstream_connectivity_failure",
+                    last_error=err_msg,
+                    details={
+                        "stage": "execute",
+                        "exit_code": outcome.exit_code,
+                        "duration_sec": outcome.duration_sec,
+                        "repair_round": repair_round,
+                    },
+                )
+                return {
+                    "ok": False,
+                    "stage": "execute",
+                    "next_action": "blocked_connectivity",
+                    "task_id": tid,
+                    "outcome": outcome.__dict__,
+                    "state": state,
+                }
 
             # 4. Separate Environment Exception Handling (max 1 automatic retry, no model escalation, no permission expansion, no repair_round consumed)
             env_exc = classify_environment_exception(outcome)
@@ -1696,12 +1797,14 @@ class Orchestrator:
                 "stage": stage,
                 "next_action": next_action,
                 "task_id": exec_res["task_id"],
-                "execution": None if stage == "prepare" else exec_res,
+                "execution": None if stage in {"prepare", "preflight"} else exec_res,
                 "verification": None,
                 "state": exec_res["state"],
             }
             if stage == "prepare" and "prepare" in exec_res:
                 out["prepare"] = exec_res["prepare"]
+            if "preflight" in exec_res:
+                out["preflight"] = exec_res["preflight"]
             if "environment_report" in exec_res:
                 out["environment_report"] = exec_res["environment_report"]
             return out
@@ -2034,6 +2137,7 @@ class Orchestrator:
         verification = read_json(tdir / "verification.json")
         result = read_json(tdir / "RESULT.json")
         environment_report = read_json(tdir / "ENVIRONMENT_REPORT.json")
+        preflight_report = read_json(tdir / "PREFLIGHT_REPORT.json")
         reviews = read_json(tdir / "reviews.json", default=[])
         return {
             "task": meta,
@@ -2042,6 +2146,7 @@ class Orchestrator:
             "verification": verification,
             "result": result,
             "environment_report": environment_report,
+            "preflight_report": preflight_report,
             "reviews": reviews,
         }
 

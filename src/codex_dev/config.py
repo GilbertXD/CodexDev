@@ -58,6 +58,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "builder": {
         "network_access": False,
         "allow_empty_diff": False,
+        "preflight_connectivity": True,
+        "preflight_timeout_sec": 5,
+        "preflight_url": None,
+        "max_consecutive_transport_errors": 5,
     },
     "prepare": {
         "enabled": True,
